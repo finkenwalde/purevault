@@ -1,0 +1,9 @@
+{% extends 'vault/base.html' %}
+{% block title %}Unlock vault · PureVault{% endblock %}
+{% block content %}
+<section class="auth-card">
+  <div class="eyebrow">WELCOME BACK</div><h1>Unlock your vault</h1>
+  <p class="muted">Your entries stay encrypted until you unlock them.</p>
+  <form method="post">{% csrf_token %}{% for field in form %}<label class="field">{{ field.label }}{{ field }}{% for error in field.errors %}<small class="error">{{ error }}</small>{% endfor %}</label>{% endfor %}<button class="button primary full" type="submit">Unlock vault</button></form>
+</section>
+{% endblock %}

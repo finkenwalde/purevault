@@ -1,0 +1,12 @@
+{% extends 'vault/base.html' %}
+{% block title %}{{ heading }} · PureVault{% endblock %}
+{% block content %}
+<a class="back-link" href="{% if editing %}{% url 'entry_detail' entry.id %}{% else %}{% url 'home' %}{% endif %}">← Cancel</a><div class="eyebrow">VAULT ENTRY</div><h1>{{ heading }}</h1>
+<form method="post" class="panel form-panel">{% csrf_token %}<p class="required-note"><span aria-hidden="true">*</span> Required</p>{% for field in form %}{% if field.name != 'delay_amount' and field.name != 'delay_unit' and field.name != 'unlock_duration_amount' and field.name != 'unlock_duration_unit' %}<label class="field"><span>{{ field.label }}{% if field.name == 'title' or field.name == 'secret' and not editing %}<span class="required-mark" aria-hidden="true">*</span>{% endif %}</span>{{ field }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}{% for error in field.errors %}<small class="error">{{ error }}</small>{% endfor %}</label>{% endif %}{% endfor %}
+  <div class="timing-settings">
+    <section class="timing-setting"><div><strong>Unlock delay <span class="required-mark" aria-hidden="true">*</span></strong><small>Wait this long before the secret becomes available.</small></div><div class="timing-controls"><label class="field">{{ form.delay_amount.label }}{{ form.delay_amount }}{% for error in form.delay_amount.errors %}<small class="error">{{ error }}</small>{% endfor %}</label><label class="field">{{ form.delay_unit.label }}{{ form.delay_unit }}</label></div></section>
+    <section class="timing-setting"><div><strong>Unlock duration <span class="required-mark" aria-hidden="true">*</span></strong><small>After the delay, keep access available for this long.</small></div><div class="timing-controls"><label class="field">{{ form.unlock_duration_amount.label }}{{ form.unlock_duration_amount }}{% for error in form.unlock_duration_amount.errors %}<small class="error">{{ error }}</small>{% endfor %}</label><label class="field">{{ form.unlock_duration_unit.label }}{{ form.unlock_duration_unit }}</label></div></section>
+  </div>
+  {% for error in form.non_field_errors %}<p class="error">{{ error }}</p>{% endfor %}<div class="form-actions"><button class="button primary" type="submit">Save entry</button><a class="button secondary" href="{% if editing %}{% url 'entry_detail' entry.id %}{% else %}{% url 'home' %}{% endif %}">Cancel</a></div>
+</form>
+{% endblock %}

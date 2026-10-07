@@ -1,0 +1,28 @@
+{% extends 'vault/base.html' %}
+{% block title %}Create your vault · PureVault{% endblock %}
+{% block content %}
+<section class="setup-screen">
+  <div class="setup-story">
+    <div class="setup-kicker"><span class="setup-kicker-dot"></span> YOUR PRIVATE SPACE</div>
+    <h1>A little space<br>between <em>you</em><br>and temptation.</h1>
+    <p>Keep the credentials you want protected in one calm, intentional place. PureVault adds a pause before access is available.</p>
+    <div class="setup-steps">
+      <div><span>01</span><p><strong>Store it securely</strong><small>Your secret is encrypted before it is saved.</small></p></div>
+      <div><span>02</span><p><strong>Let time do its work</strong><small>Every unlock request starts a waiting period.</small></p></div>
+      <div><span>03</span><p><strong>Choose deliberately</strong><small>Cancel anytime and the full wait starts again.</small></p></div>
+    </div>
+    <div class="setup-orb" aria-hidden="true"><div class="orb-ring ring-one"></div><div class="orb-ring ring-two"></div><div class="orb-core">PV</div><span class="orb-star star-one">✳</span><span class="orb-star star-two">✧</span></div>
+  </div>
+  <div class="setup-form-card">
+    <div class="eyebrow">FIRST-TIME SETUP</div>
+    <h2>Make it yours.</h2>
+    <p class="setup-form-intro">Start with a strong master passphrase. It protects the secrets you add to PureVault.</p>
+    <form method="post">{% csrf_token %}
+      {% for field in form %}<label class="field">{{ field.label }}{{ field }}{% if field.help_text %}<small>{{ field.help_text }}</small>{% endif %}{% for error in field.errors %}<small class="error">{{ error }}</small>{% endfor %}</label>{% endfor %}
+      <div class="setup-warning"><span>✦</span><p><strong>Keep it somewhere safe.</strong><br>This passphrase cannot be recovered if you forget it.</p></div>
+      <button class="button primary full setup-submit" type="submit">Create my vault <span>→</span></button>
+    </form>
+    <div class="setup-secure"><span>◈</span> Encrypted storage · You stay in control</div>
+  </div>
+</section>
+{% endblock %}

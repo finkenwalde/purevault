@@ -1,0 +1,3 @@
+{% extends 'vault/base.html' %}
+{% block title %}Delete {{ entry.title }} · PureVault{% endblock %}
+{% block content %}<a class="back-link" href="{% url 'entry_detail' entry.id %}">← Back</a><section class="auth-card"><div class="eyebrow">DELETE ENTRY</div><h1>Delete “{{ entry.title }}”?</h1><p class="muted">This permanently removes the encrypted secret and its unlock timer.</p><form method="post">{% csrf_token %}<button class="button danger full" type="submit">Delete permanently</button></form></section>{% endblock %}

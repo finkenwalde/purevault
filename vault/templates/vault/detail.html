@@ -1,0 +1,18 @@
+{% extends 'vault/base.html' %}
+{% block title %}{{ entry.title }} · PureVault{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'home' %}">← All entries</a>
+<div class="detail-heading"><div><div class="eyebrow">PROTECTED ENTRY</div><h1>{{ entry.title }}</h1><p class="muted">{% if entry.website %}<a href="{{ entry.website_href }}" rel="noreferrer">{{ entry.website }}</a>{% else %}Credential details{% endif %}</p></div><a class="button secondary" href="{% url 'edit_entry' entry.id %}">Edit</a></div>
+<section class="panel"><div class="panel-title">Access status</div>
+{% if entry.unlocked %}
+  <div class="status-line ready"><span class="status-dot"></span><div><strong>Secret is unlocked</strong><small>Locks again {{ entry.unlock_expires_at|date:'N j, Y, P' }}</small></div></div>
+  <div class="unlock-actions"><form method="post" action="{% url 'reveal_entry' entry.id %}" class="reveal-form">{% csrf_token %}<label class="field">Confirm master password<input type="password" name="password" autocomplete="current-password" required></label><button class="button primary" type="submit">View secret</button></form><form method="post" action="{% url 'cancel_unlock' entry.id %}">{% csrf_token %}<button class="button secondary" type="submit">Lock now</button></form></div>
+{% elif entry.unlock_pending %}
+  <div class="status-line pending"><span class="status-dot"></span><div><strong>Unlock requested</strong><small>Available {{ entry.unlock_at|date:'N j, Y, P' }}</small></div></div><form method="post" action="{% url 'cancel_unlock' entry.id %}">{% csrf_token %}<button class="button secondary" type="submit">Cancel request and reset timer</button></form>
+{% else %}
+  <div class="status-line locked"><span class="status-dot"></span><div><strong>Secret is locked</strong><small>Wait {{ entry.delay_display }} · then available for {{ entry.unlock_duration_display }}</small></div></div><form method="post" action="{% url 'request_unlock' entry.id %}">{% csrf_token %}<button class="button primary" type="submit">Start unlock delay</button></form>
+{% endif %}
+</section>
+<section class="panel metadata"><div><span>Username</span><strong>{% if entry.username %}{{ entry.username }}{% else %}—{% endif %}</strong></div><div><span>Notes</span><strong>{% if entry.notes %}{{ entry.notes|linebreaksbr }}{% else %}—{% endif %}</strong></div><div><span>Unlock duration</span><strong>{{ entry.unlock_duration_display }}</strong></div><div><span>Last updated</span><strong>{{ entry.updated_at|date:'N j, Y' }}</strong></div></section>
+<form method="post" action="{% url 'delete_entry' entry.id %}" class="delete-form">{% csrf_token %}<button type="submit" class="text-danger" onclick="return confirm('Permanently delete this entry?')">Delete entry</button></form>
+{% endblock %}

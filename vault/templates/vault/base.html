@@ -1,0 +1,45 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}PureVault{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'vault/style.css' %}">
+  <link rel="stylesheet" href="{% static 'vault/setup.css' %}">
+  <link rel="stylesheet" href="{% static 'vault/entry-form.css' %}">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="{% url 'home' %}"><img class="brand-mark" src="{% static 'vault/purevault-mark.svg' %}" alt=""> PureVault</a>
+    {% if request.session.vault_authenticated %}
+      <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="quiet-button" type="submit">Lock vault</button></form>
+    {% endif %}
+  </header>
+  <main class="shell">
+    {% if messages %}{% for message in messages %}<div class="notice">{{ message }}</div>{% endfor %}{% endif %}
+    {% block content %}{% endblock %}
+  </main>
+  <footer>Private by design. Keep your master password safe.</footer>
+  {% if request.session.vault_authenticated %}
+  <script>
+    (() => {
+      const expiresAt = {{ vault_session_expires_at }};
+      const loginUrl = "{% url 'login' %}";
+      const redirectIfExpired = () => {
+        const remaining = expiresAt - Date.now();
+        if (remaining <= 0) {
+          window.location.replace(loginUrl);
+          return;
+        }
+        window.setTimeout(redirectIfExpired, Math.min(remaining, 1000));
+      };
+      document.addEventListener("visibilitychange", () => {
+        if (!document.hidden) redirectIfExpired();
+      });
+      redirectIfExpired();
+    })();
+  </script>
+  {% endif %}
+</body>
+</html>

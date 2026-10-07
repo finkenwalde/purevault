@@ -1,0 +1,25 @@
+{% extends 'vault/base.html' %}
+{% block title %}Reveal {{ entry.title }} · PureVault{% endblock %}
+{% block content %}
+<a class="back-link" href="{% url 'entry_detail' entry.id %}">← Back to entry</a>
+<section class="panel reveal-panel"><div class="eyebrow">TEMPORARY ACCESS</div><h1>{{ entry.title }}</h1>
+{% if secret %}<p class="muted">Available until {{ entry.unlock_expires_at|date:'N j, Y, P' }}. This page will return to the locked entry when the duration ends.</p><div class="secret-box" data-expires-at="{{ entry.unlock_expires_at|date:'c' }}" data-lock-url="{% url 'entry_detail' entry.id %}"><code>{% for character, kind in secret_characters %}<span class="secret-character {{ kind }}">{{ character }}</span>{% endfor %}</code></div><div class="secret-legend" aria-label="Character color key"><span><i class="letter">Aa</i> Letters</span><span><i class="number">09</i> Numbers</span><span><i class="symbol">!@</i> Symbols</span></div><button class="button secondary" type="button" onclick="navigator.clipboard.writeText(document.querySelector('.secret-box code').innerText); this.innerText='Copied'">Copy secret</button>
+<script>
+(() => {
+  const secretBox = document.querySelector('.secret-box');
+  const expiry = new Date(secretBox.dataset.expiresAt).getTime();
+  const lockWhenExpired = () => {
+    const remaining = expiry - Date.now();
+    if (remaining <= 0) {
+      secretBox.textContent = '';
+      window.location.replace(secretBox.dataset.lockUrl);
+      return;
+    }
+    window.setTimeout(lockWhenExpired, Math.min(remaining, 30000));
+  };
+  document.addEventListener('visibilitychange', lockWhenExpired);
+  lockWhenExpired();
+})();
+</script>
+{% else %}<p class="muted">Confirm your master password to decrypt this secret.</p><form method="post">{% csrf_token %}{% for field in form %}<label class="field">{{ field.label }}{{ field }}{% for error in field.errors %}<small class="error">{{ error }}</small>{% endfor %}</label>{% endfor %}<button class="button primary" type="submit">Decrypt secret</button></form>{% endif %}</section>
+{% endblock %}

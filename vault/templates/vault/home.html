@@ -1,0 +1,7 @@
+{% extends 'vault/base.html' %}
+{% block title %}Your vault · PureVault{% endblock %}
+{% block content %}
+<div class="page-heading"><div><div class="eyebrow">YOUR PRIVATE VAULT</div><h1>Protected access</h1><p class="muted">Secrets stay locked until their waiting period ends.</p></div><a class="button primary" href="{% url 'create_entry' %}">＋ Add entry</a></div>
+{% if entries %}<div class="entry-list">{% for entry in entries %}<a class="entry-card" href="{% url 'entry_detail' entry.id %}"><span class="entry-icon">{{ entry.title|first|upper }}</span><span class="entry-copy"><strong>{{ entry.title }}</strong><small>{% if entry.username %}{{ entry.username }}{% else %}Secret{% endif %}</small></span><span class="status-pill {% if entry.unlocked %}unlocked{% elif entry.unlock_pending %}pending{% else %}locked{% endif %}">{% if entry.unlocked %}Unlocked{% elif entry.unlock_pending %}Waiting{% else %}Locked{% endif %}</span><span class="chevron">›</span></a>{% endfor %}</div>{% else %}<div class="empty-state"><div class="empty-icon">✳</div><h2>Your vault is ready</h2><p class="muted">Add a credential to begin building your protected list.</p><a class="button primary" href="{% url 'create_entry' %}">Add your first entry</a></div>{% endif %}
+<p class="security-note"><span>◈</span> Secrets are encrypted in storage. Unlock requests are timed on the server.</p>
+{% endblock %}

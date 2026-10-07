@@ -1,0 +1,10 @@
+.brand-mark{display:block;width:36px;height:36px;border-radius:10px;background:none}
+.required-note{margin:0 0 8px;color:#778078;font-size:11px}
+.required-note>span,.required-mark{color:#b42318;font-weight:800}
+.field>span:first-child{display:inline}
+.secret-character.letter,.secret-legend .letter{color:#145a43}
+.secret-character.number,.secret-legend .number{color:#225fbc}
+.secret-character.symbol,.secret-legend .symbol{color:#a04513}
+.secret-legend{display:flex;flex-wrap:wrap;gap:14px;margin:-6px 0 18px;color:#778078;font-size:11px}
+.secret-legend span{display:inline-flex;align-items:center;gap:5px}
+.secret-legend i{font-style:normal;font-weight:800;font-family:ui-monospace,monospace}

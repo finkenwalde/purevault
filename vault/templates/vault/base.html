@@ -24,6 +24,22 @@
   {% if request.session.vault_authenticated %}
   <script>
     (() => {
+      const clock = document.getElementById("server-clock");
+      if (clock) {
+        const serverTimestamp = Number(clock.dataset.serverNow);
+        const monotonicStart = performance.now();
+        const formatter = new Intl.DateTimeFormat(undefined, {
+          timeZone: clock.dataset.timeZone,
+          dateStyle: "medium",
+          timeStyle: "medium"
+        });
+        const updateClock = () => {
+          clock.textContent = formatter.format(new Date(serverTimestamp + performance.now() - monotonicStart));
+        };
+        updateClock();
+        window.setInterval(updateClock, 1000);
+      }
+
       const expiresAt = {{ vault_session_expires_at }};
       const loginUrl = "{% url 'login' %}";
       const redirectIfExpired = () => {

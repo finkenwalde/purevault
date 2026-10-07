@@ -9,6 +9,7 @@ services:
       DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
       DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1}
       DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-0}
+      TZ: ${TZ:-UTC}
       DATA_DIR: /data
     volumes:
       - lockbox_data:/data

@@ -47,7 +47,7 @@ WSGI_APPLICATION = "config.wsgi.application"
 
 DATABASES = {"default": {"ENGINE": "django.db.backends.sqlite3", "NAME": DATA_DIR / "lockbox.sqlite3", "OPTIONS": {"timeout": 20}}}
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+TIME_ZONE = os.environ.get("TZ", "UTC")
 USE_I18N = True
 USE_TZ = True
 STATIC_URL = "/static/"

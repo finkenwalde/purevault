@@ -1,0 +1,30 @@
+name: purevault
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: purevault:local
+    restart: unless-stopped
+    ports:
+      - "${PUREVAULT_BIND_ADDRESS:-127.0.0.1}:${PUREVAULT_PORT:-8127}:8000"
+    environment:
+      PUREVAULT_ALLOWED_HOSTS: "${PUREVAULT_ALLOWED_HOSTS:-localhost,127.0.0.1}"
+      PUREVAULT_DISPLAY_TIMEZONE: "${PUREVAULT_DISPLAY_TIMEZONE:-UTC}"
+      PUREVAULT_CSRF_TRUSTED_ORIGINS: "${PUREVAULT_CSRF_TRUSTED_ORIGINS:-}"
+      PUREVAULT_SECURE_COOKIES: "${PUREVAULT_SECURE_COOKIES:-false}"
+      PUREVAULT_SECURE_SSL_REDIRECT: "${PUREVAULT_SECURE_SSL_REDIRECT:-false}"
+      PUREVAULT_HSTS_SECONDS: "${PUREVAULT_HSTS_SECONDS:-0}"
+      PUREVAULT_TRUST_PROXY_HEADERS: "${PUREVAULT_TRUST_PROXY_HEADERS:-false}"
+    volumes:
+      - purevault_data:/data
+      - purevault_keys:/keys
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  purevault_data:
+  purevault_keys:
+

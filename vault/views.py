@@ -73,9 +73,9 @@ def _entry_metadata(entry, runtime_ms=None, wall_now=None):
     access_estimate = None
     if grant and state == "waiting":
         eligible_estimate = wall_now + timedelta(milliseconds=remaining_ms)
-        if entry.relock_policy == VaultEntry.RelockPolicy.AUTOMATIC:
-            access_estimate = eligible_estimate + timedelta(seconds=entry.relock_after_seconds)
-    elif grant and state == "available" and entry.relock_policy == VaultEntry.RelockPolicy.AUTOMATIC:
+        if grant.access_until_runtime_ms is not None:
+            access_estimate = eligible_estimate + timedelta(milliseconds=grant.access_until_runtime_ms - grant.eligible_runtime_ms)
+    elif grant and state == "available" and grant.access_until_runtime_ms is not None:
         eligible_estimate = wall_now
         access_estimate = wall_now + timedelta(milliseconds=remaining_ms)
     return {
@@ -402,14 +402,19 @@ def _validated_email_configuration(data, existing):
     from_name = clean_header(data.get("from_name", ""), "From name", 100)
     from_email_value = data.get("from_email", "")
     from_email = normalize_email(from_email_value, "From email") if from_email_value else ""
-    action = data.get("password_action", "keep")
-    if action not in {"keep", "replace", "clear"}:
-        raise ValidationError("Choose whether to keep, replace, or clear the SMTP password.")
-    encrypted_password = existing.encrypted_password if existing and action == "keep" else None
-    if action == "replace":
-        password = data.get("password", "")
-        if not isinstance(password, str) or not password or len(password) > 1024:
-            raise ValidationError("SMTP password is required and must be at most 1024 characters.")
+    password = data.get("password", "")
+    clear_password = data.get("clear_password", False)
+    if not isinstance(password, str) or len(password) > 1024:
+        raise ValidationError("SMTP password must be at most 1024 characters.")
+    if not isinstance(clear_password, bool):
+        raise ValidationError("Clear password must be true or false.")
+    if password and clear_password:
+        raise ValidationError("Enter a replacement password or remove the saved password, not both.")
+    endpoint_changed = bool(existing) and (host, port, security, username) != (existing.host, existing.port, existing.security, existing.username)
+    if existing and existing.encrypted_password and endpoint_changed and not password and not clear_password:
+        raise ValidationError("The SMTP endpoint or username changed. Enter the password for the new destination or explicitly remove the saved password.")
+    encrypted_password = existing.encrypted_password if existing and not clear_password else None
+    if password:
         from vault.crypto import encrypt_text
         encrypted_password = encrypt_text(password)
     password_present = bool(encrypted_password)
@@ -425,9 +430,8 @@ def _validated_email_configuration(data, existing):
 def email_settings_update(request):
     try:
         data = _json_body(request)
-        if set(data) - {"enabled", "host", "port", "security", "username", "password_action", "password", "from_email", "from_name", "current_password"}:
+        if set(data) - {"enabled", "host", "port", "security", "username", "password", "clear_password", "from_email", "from_name"}:
             raise ValidationError("Unsupported email setting.")
-        _reauthenticate(request, data)
         with transaction.atomic():
             existing = EmailSettings.objects.select_for_update().filter(owner=request.user).first()
             previous_snapshot = encrypted_transport_snapshot(existing)
@@ -446,7 +450,7 @@ def email_settings_update(request):
                     next_attempt_at=timezone.now(), needs_attention=False, last_error="",
                 )
             after = _email_settings_json(configuration)
-            changed = before != after or data.get("password_action") in {"replace", "clear"}
+            changed = before != after or bool(data.get("password")) or data.get("clear_password") is True
             if changed:
                 event_type = MailDelivery.EventType.NOTIFICATIONS_DISABLED if before["enabled"] and not after["enabled"] else MailDelivery.EventType.SMTP_CONFIGURATION_CHANGED
                 event_id = os.urandom(16).hex()
@@ -463,9 +467,8 @@ def email_settings_update(request):
 def email_test(request):
     try:
         data = _json_body(request)
-        if set(data) - {"destination", "current_password"}:
+        if set(data) - {"destination"}:
             raise ValidationError("Unsupported test-email field.")
-        _reauthenticate(request, data)
         destination = normalize_email(data.get("destination", ""), "Test destination")
         configuration = EmailSettings.objects.filter(owner=request.user).first()
         if not transport_is_usable(transport_from_settings(configuration)):
@@ -500,10 +503,20 @@ def entries(request):
 def entry_detail(request, entry_id):
     entry = _owned_entry(request, entry_id)
     try:
-        values = validate_entry_payload(_json_body(request), editing=True)
+        data = _json_body(request)
+        relock_after_save = data.pop("relock", False)
+        if not isinstance(relock_after_save, bool):
+            raise ValidationError("Relock must be true or false.")
+        values = validate_entry_payload(data, editing=True)
         secret = values.pop("password")
         try:
-            entry = update_entry_if_available(entry, request.user, encrypted_secret=encrypt_secret(secret), values=values)
+            entry = update_entry_if_available(
+                entry,
+                request.user,
+                encrypted_secret=encrypt_secret(secret) if secret is not None else None,
+                values=values,
+                relock=relock_after_save,
+            )
         except EntryNotAvailable:
             return _error("The entry must be available before its secret or security policy can be changed.", 423)
         return JsonResponse({"entry": _entry_metadata(entry)})

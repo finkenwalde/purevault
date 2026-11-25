@@ -72,6 +72,14 @@ textarea {
   color: white;
   font-family: Georgia, serif;
 }
+.brand-button {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  border-radius: 10px;
+}
 .account {
   display: flex;
   align-items: center;
@@ -162,7 +170,7 @@ textarea {
 }
 .stats {
   display: grid;
-  grid-template-columns: repeat(3, 130px) 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 15px;
@@ -183,18 +191,9 @@ textarea {
   font-family: Georgia, serif;
   font-weight: 500;
 }
-.stats span,
-.stats small {
+.stats span {
   color: var(--muted);
   font-size: 12px;
-}
-.stats .clock {
-  align-items: flex-end;
-}
-.stats .clock strong {
-  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
-  font-size: 16px;
-  margin: 3px 0;
 }
 .section-heading {
   display: flex;
@@ -506,6 +505,13 @@ fieldset legend {
   text-align: center;
   margin: 28px 10px 0;
 }
+.remember-username {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 13px;
+}
 .text-button {
   border: 0;
   background: none;
@@ -524,6 +530,16 @@ footer {
   max-width: 760px;
   line-height: 1.6;
 }
+.footer-clock {
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 12px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.footer-clock time {
+  color: var(--ink);
+}
 @media (max-width: 760px) {
   .app-shell {
     padding: 34px 16px;
@@ -541,13 +557,8 @@ footer {
   .hero h1 {
     font-size: 43px;
   }
-  .stats {
-    grid-template-columns: repeat(3, 1fr);
-  }
-  .stats .clock {
-    grid-column: 1/-1;
-    align-items: flex-start;
-    border-top: 1px solid var(--line);
+  .stats > div {
+    padding: 16px 12px;
   }
   .entry-grid {
     grid-template-columns: 1fr;
@@ -572,12 +583,89 @@ footer {
   }
 }
 
-.settings-panel {
-  max-width: 900px;
+.settings-shell {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 46px 24px 70px;
+}
+.settings-page {
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 32px;
+  box-shadow: 0 12px 35px rgba(44, 54, 47, 0.06);
+}
+.settings-page .section-heading h1 {
+  font-family: Georgia, serif;
+  font-size: 38px;
+  font-weight: 500;
+  margin: 5px 0 0;
+}
+.settings-layout {
+  display: grid;
+  grid-template-columns: minmax(155px, 21%) minmax(0, 1fr);
+  gap: 24px;
+  align-items: start;
+}
+.settings-nav {
+  display: grid;
+  gap: 8px;
+}
+.settings-nav button {
+  text-align: left;
+  color: var(--green);
+  font-size: 13px;
+  font-weight: 700;
+  padding: 11px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  cursor: pointer;
+}
+.settings-nav button[aria-selected="true"] {
+  background: #edf4ef;
+  border-color: #bfd1c6;
 }
 .timezone-form {
   display: grid;
   gap: 16px;
+}
+.timezone-picker {
+  position: relative;
+  z-index: 1;
+}
+.timezone-options {
+  position: absolute;
+  top: 65px;
+  inset-inline: 0;
+  background: white;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(44, 54, 47, 0.15);
+  overflow: hidden;
+}
+.timezone-options ul {
+  max-height: min(240px, 35vh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+.timezone-options li,
+.timezone-options p {
+  padding: 8px 12px;
+  margin: 0;
+}
+.timezone-options li {
+  cursor: pointer;
+}
+.timezone-options li:hover,
+.timezone-options .active-option {
+  background: #e4efe8;
+}
+.timezone-options [aria-selected="true"] {
+  font-weight: 700;
 }
 .suggestion {
   display: flex;
@@ -587,10 +675,50 @@ footer {
   color: var(--muted);
   font-size: 13px;
 }
+.timezone-preview {
+  display: grid;
+  gap: 5px;
+  padding: 16px;
+  border: 1px solid #c9dbd0;
+  border-radius: 10px;
+  background: #eef4f0;
+}
+.timezone-preview span,
+.timezone-preview small {
+  color: var(--muted);
+  font-size: 12px;
+}
+.timezone-preview time {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+.password-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+.password-row input {
+  width: 100%;
+}
+.password-row button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+}
+.eye-icon {
+  width: 18px;
+  height: 18px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.warning.compact {
+  margin: 3px 0 0;
+}
 .settings-section {
-  border-top: 1px solid var(--line);
-  padding-top: 25px;
-  margin-top: 28px;
+  min-width: 0;
 }
 .settings-section h3 {
   font-family: Georgia, serif;
@@ -730,6 +858,30 @@ footer {
   line-height: 1.5;
 }
 @media (max-width: 760px) {
+  .settings-layout {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 18px;
+  }
+  .suggestion {
+    flex-wrap: wrap;
+  }
+  .settings-shell {
+    padding: 26px 14px 50px;
+  }
+  .settings-page {
+    padding: 20px;
+  }
+  .settings-page .section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+  }
+  .settings-page .section-heading h1 {
+    font-size: 32px;
+  }
+  .password-row {
+    grid-template-columns: 1fr;
+  }
   .settings-grid {
     grid-template-columns: 1fr;
   }

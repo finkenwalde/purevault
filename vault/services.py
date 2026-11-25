@@ -67,7 +67,7 @@ def initialize_runtime_clock(*, monotonic_ns=None, generation=None):
         elapsed = clock.elapsed_milliseconds
         UnlockGrant.objects.filter(eligible_runtime_ms__isnull=True).delete()
         UnlockGrant.objects.filter(
-            entry__relock_policy=VaultEntry.RelockPolicy.AUTOMATIC,
+            access_until_runtime_ms__isnull=False,
             eligible_runtime_ms__lte=elapsed,
         ).delete()
         clock.generation = generation
@@ -103,7 +103,7 @@ def advance_runtime_clock(*, expected_generation=None, timekeeper=False, _monoto
         if delta_ms < 0:
             with transaction.atomic():
                 UnlockGrant.objects.filter(
-                    entry__relock_policy=VaultEntry.RelockPolicy.AUTOMATIC,
+                    access_until_runtime_ms__isnull=False,
                     eligible_runtime_ms__lte=clock.elapsed_milliseconds,
                 ).delete()
             return ClockSnapshot(clock.elapsed_milliseconds, continuity_lost=True)
@@ -126,7 +126,7 @@ def advance_runtime_clock(*, expected_generation=None, timekeeper=False, _monoto
                 elapsed = clock.elapsed_milliseconds + credited_ms
                 if lost:
                     UnlockGrant.objects.filter(
-                        entry__relock_policy=VaultEntry.RelockPolicy.AUTOMATIC,
+                        access_until_runtime_ms__isnull=False,
                         eligible_runtime_ms__lte=elapsed,
                     ).delete()
                 return ClockSnapshot(elapsed, continuity_lost=lost)
@@ -234,7 +234,7 @@ def release_secret(entry):
             return None, "locked"
         state, _, _ = grant_status(entry, runtime_ms)
         if state != "available":
-            if state == "locked" and entry.relock_policy == VaultEntry.RelockPolicy.AUTOMATIC:
+            if state == "locked" and grant.access_until_runtime_ms is not None:
                 UnlockGrant.objects.filter(pk=grant.pk).delete()
             return None, state
         now = timezone.now()
@@ -244,15 +244,18 @@ def release_secret(entry):
         return decrypt_secret(entry.encrypted_secret), "available"
 
 
-def update_entry_if_available(entry, owner, *, encrypted_secret, values):
+def update_entry_if_available(entry, owner, *, encrypted_secret=None, values, relock=False):
     with transaction.atomic():
         runtime_ms = advance_runtime_clock().elapsed_ms
-        entry = VaultEntry.objects.get(pk=entry.pk, owner=owner)
+        entry = VaultEntry.objects.select_for_update().get(pk=entry.pk, owner=owner)
+        UnlockGrant.objects.select_for_update().filter(entry=entry).first()
         state, _, _ = grant_status(entry, runtime_ms)
         if state != "available":
             raise EntryNotAvailable
-        VaultEntry.objects.filter(pk=entry.pk, owner=owner).update(
-            encrypted_secret=encrypted_secret, updated_at=timezone.now(), **values,
-        )
-        UnlockGrant.objects.filter(entry=entry).delete()
+        updates = {"updated_at": timezone.now(), **values}
+        if encrypted_secret is not None:
+            updates["encrypted_secret"] = encrypted_secret
+        VaultEntry.objects.filter(pk=entry.pk, owner=owner).update(**updates)
+        if relock:
+            UnlockGrant.objects.filter(entry=entry).delete()
         return VaultEntry.objects.get(pk=entry.pk)

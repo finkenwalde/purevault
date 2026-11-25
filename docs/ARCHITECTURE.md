@@ -8,7 +8,7 @@ Every entry belongs to an authenticated owner. A new entry starts locked. Starti
 
 For automatic relocking, the access target is calculated from the unlock target, not from the first reveal. Eligibility is the half-open runtime interval `[eligible_runtime, access_until_runtime)`. At the exact access target the grant is expired. Manual grants remain eligible until explicitly relocked. Reveal and edit refresh the clock and check eligibility again inside their database transaction; metadata never contains plaintext. A release and cancellation that race are ordered by the database: a completed release may return plaintext, while a cancellation committed first makes release fail. Relocking cannot revoke plaintext already copied or observed.
 
-Changing a secret or security policy requires currently eligible access and relocks the entry after the change. This simple rule prevents an edit from extending an existing grant.
+Changing a secret or security policy requires currently eligible access. A plain save preserves the existing grant's original eligibility and finite access deadline exactly; changed delay and relock settings apply only to the next unlock. “Save changes and relock” updates the entry and deletes the grant in the same transaction. Grant expiry is stored on the grant rather than inferred from mutable entry policy, so changing an automatic policy to manual cannot turn the current window into indefinite access. A blank replacement-password field retains the encrypted secret, and plaintext is fetched only by an explicit eligibility-checked reveal.
 
 ## Durations and clocks
 
@@ -18,7 +18,7 @@ One container-level generation uses Python's monotonic clock and a durable SQLit
 
 Restart initialization sets a new monotonic baseline without crediting downtime. Waiting therefore pauses while the service is stopped, and an abrupt stop can conservatively lose up to the last uncheckpointed fraction. Manual grants remain available across restart. An automatic grant that had reached its access window is invalidated when continuity is interrupted or the application restarts, preventing a frozen clock from extending access. Migration from the earlier wall-clock release model clears legacy unlock grants but preserves accounts, entries, encrypted secrets, and policies; users start a new full wait.
 
-The API supplies authoritative remaining durations. Browser countdowns use `performance.now()` only for animation and resynchronize every five seconds. UTC and selected-timezone dates are estimates for convenience, never release inputs. Each account can persist a valid IANA display timezone; `PUREVAULT_DISPLAY_TIMEZONE` is the fallback. IANA rules provide DST-aware presentation. Browser clock and timezone changes do not alter policy.
+The API supplies authoritative remaining durations. Browser countdowns and the selected-timezone clock use a server timestamp plus `performance.now()` only for display and resynchronize every five seconds. Displayed dates are estimates for convenience, never release inputs. Each account can persist a valid IANA display timezone; `PUREVAULT_DISPLAY_TIMEZONE` is the fallback. IANA rules provide DST-aware presentation. Browser clock and timezone changes do not alter policy.
 
 This protects against ordinary wall-clock adjustments, browser clock changes, and unverified downtime. A person controlling the host can still modify the database, kernel, process, or executable code; Purevault does not provide a trusted external enforcement boundary.
 

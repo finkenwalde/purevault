@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   MEANINGFUL_ACTIVITY_EVENTS,
   advanceSessionGeneration,
@@ -157,6 +157,12 @@ function remaining(entry: Entry, nowPerformance: number) {
     .join(" ");
 }
 
+function remainingSeconds(entry: Entry, nowPerformance: number) {
+  if (entry.remaining_seconds === null) return null;
+  const elapsed = Math.max(0, (nowPerformance - (entry.sync_performance_ms || nowPerformance)) / 1000);
+  return Math.max(0, entry.remaining_seconds - elapsed);
+}
+
 function localTime(value: string | null, zone: string) {
   if (!value) return "—";
   return new Intl.DateTimeFormat(undefined, {
@@ -164,6 +170,34 @@ function localTime(value: string | null, zone: string) {
     timeStyle: "medium",
     timeZone: zone,
   }).format(new Date(value));
+}
+
+function clockTime(value: Date, zone: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: zone,
+    timeZoneName: "short",
+  }).format(value);
+}
+
+function zoneLabel(zone: string) {
+  return zone === "UTC" ? "UTC — Coordinated Universal Time" : zone.replaceAll("_", " ").replace("/", " — ");
+}
+
+function durationFields(seconds: number) {
+  const units: [number, string][] = [
+    [86400, "days"],
+    [3600, "hours"],
+    [60, "minutes"],
+    [1, "seconds"],
+  ];
+  const [factor, unit] = units.find(([candidate]) => seconds % candidate === 0) || units[3];
+  return { amount: String(seconds / factor), unit };
 }
 
 function Secret({ value }: { value: string }) {
@@ -204,30 +238,78 @@ function EntryForm({
   editing?: Entry | null;
   onCancel?: () => void;
 }) {
-  const [form, setForm] = useState(emptyForm);
+  const initialForm = useMemo(() => {
+    if (!editing) return { ...emptyForm };
+    const delay = durationFields(editing.unlock_delay_seconds);
+    const relock = durationFields(editing.relock_after_seconds || 1);
+    return {
+      title: editing.title,
+      password: "",
+      unlock_delay: delay.amount,
+      unlock_unit: delay.unit,
+      relock_policy: editing.relock_policy,
+      relock_after: relock.amount,
+      relock_unit: relock.unit,
+    };
+  }, [editing]);
+  const [form, setForm] = useState(initialForm);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [currentSecret, setCurrentSecret] = useState<string | null>(null);
+  const [showCurrent, setShowCurrent] = useState(false);
+  const revealRequest = useRef(0);
   const set = (key: string, value: string) =>
     setForm((current) => ({ ...current, [key]: value }));
   useEffect(() => {
-    if (editing)
-      setForm((current) => ({
-        ...current,
-        title: editing.title,
-        password: "",
-        relock_policy: editing.relock_policy,
-      }));
-  }, [editing]);
+    setForm(initialForm);
+    setCurrentSecret(null);
+    setShowCurrent(false);
+    revealRequest.current += 1;
+  }, [initialForm]);
+  useEffect(() => () => { revealRequest.current += 1; }, []);
+  async function revealCurrent() {
+    if (!editing) return;
+    if (showCurrent) {
+      revealRequest.current += 1;
+      setCurrentSecret(null);
+      setShowCurrent(false);
+      return;
+    }
+    const request = ++revealRequest.current;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api<{ password: string }>(`/entries/${editing.id}/reveal/`, {
+        method: "POST",
+        body: "{}",
+      });
+      if (request !== revealRequest.current) return;
+      setCurrentSecret(result.password);
+      setShowCurrent(true);
+    } catch (err) {
+      if (request === revealRequest.current) setError((err as Error).message);
+    } finally {
+      if (request === revealRequest.current) setBusy(false);
+    }
+  }
   async function submit(event: FormEvent) {
     event.preventDefault();
+    const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
+    const relock = editing && submitter?.value === "relock";
     setBusy(true);
     setError("");
     try {
       const result = await api<{ entry: Entry }>(
         editing ? `/entries/${editing.id}/` : "/entries/",
-        { method: editing ? "PUT" : "POST", body: JSON.stringify(form) },
+        {
+          method: editing ? "PUT" : "POST",
+          body: JSON.stringify(editing ? { ...form, relock } : form),
+        },
       );
-      setForm(emptyForm);
+      revealRequest.current += 1;
+      setCurrentSecret(null);
+      setShowCurrent(false);
+      setForm({ ...emptyForm });
       onCreated(result.entry);
     } catch (err) {
       setError((err as Error).message);
@@ -249,20 +331,52 @@ function EntryForm({
         />
       </div>
       <div className="field full">
-        <label htmlFor="entry-password">
-          Password{" "}
-          {editing && <span className="hint">(enter the new value)</span>}
-        </label>
+        <label htmlFor="entry-password">{editing ? "Replacement password" : "Password"}</label>
         <input
           id="entry-password"
           type="password"
           value={form.password}
           onChange={(e) => set("password", e.target.value)}
           maxLength={4096}
-          required
+          required={!editing}
           autoComplete="new-password"
+          placeholder={editing ? "Leave blank to keep the current password" : undefined}
         />
+        {editing && <small className="hint">Leave blank to keep the current password.</small>}
       </div>
+      {editing && (
+        <div className="field full">
+          <label htmlFor="current-entry-password">Current password</label>
+          <div className="password-row">
+            <input
+              id="current-entry-password"
+              type={showCurrent ? "text" : "password"}
+              value={currentSecret ?? "password-hidden"}
+              readOnly
+              autoComplete="off"
+              aria-describedby="current-password-help"
+            />
+            <button
+              type="button"
+              className="button ghost"
+              onClick={revealCurrent}
+              disabled={busy}
+              aria-label={showCurrent ? "Hide current password" : "Show current password"}
+              aria-pressed={showCurrent}
+            >
+              <svg className="eye-icon" viewBox="0 0 24 24" aria-hidden="true">
+                {showCurrent ? (
+                  <><path d="M3 3l18 18" /><path d="M10.6 10.7a2 2 0 002.7 2.7" /><path d="M9.9 4.2A10.8 10.8 0 0112 4c5.5 0 9 6 9 6a18 18 0 01-2.4 3.1M6.6 6.6C4.4 8.1 3 10 3 10s3.5 6 9 6c1 0 1.9-.2 2.7-.5" /></>
+                ) : (
+                  <><path d="M3 12s3.5-6 9-6 9 6 9 6-3.5 6-9 6-9-6-9-6z" /><circle cx="12" cy="12" r="2.5" /></>
+                )}
+              </svg>
+              {showCurrent ? "Hide" : "Show"}
+            </button>
+          </div>
+          <small className="hint" id="current-password-help">The plaintext is fetched only when Show is selected and only while this entry remains available.</small>
+        </div>
+      )}
       <div className="field">
         <label htmlFor="delay">Unlock delay</label>
         <div className="duration">
@@ -344,18 +458,16 @@ function EntryForm({
           {error}
         </p>
       )}
+      {editing && <p className="hint full">Saving keeps the current access window exactly as it is. Policy and delay changes apply to the next unlock. Choose Save changes and relock to end access now.</p>}
       <div className="form-actions full">
         {onCancel && (
           <button type="button" className="button ghost" onClick={onCancel}>
             Cancel
           </button>
         )}
-        <button className="button primary" disabled={busy}>
-          {busy
-            ? "Saving…"
-            : editing
-              ? "Save and relock"
-              : "Create locked entry"}
+        {editing && <button className="button secondary" name="save_action" value="save" disabled={busy}>{busy ? "Saving…" : "Save changes"}</button>}
+        <button className="button primary" name="save_action" value={editing ? "relock" : "create"} disabled={busy}>
+          {busy ? "Saving…" : editing ? "Save changes and relock" : "Create locked entry"}
         </button>
       </div>
     </form>
@@ -366,9 +478,17 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
   const [mode, setMode] = useState<"login" | "setup">(
     session.setup_required ? "setup" : "login",
   );
-  const [username, setUsername] = useState(""),
+  const remembered = useMemo(() => {
+    try {
+      return localStorage.getItem("purevault-remembered-username") || "";
+    } catch {
+      return "";
+    }
+  }, []);
+  const [username, setUsername] = useState(remembered),
     [password, setPassword] = useState(""),
     [confirmation, setConfirmation] = useState("");
+  const [rememberUsername, setRememberUsername] = useState(Boolean(remembered));
   const [error, setError] = useState(""),
     [busy, setBusy] = useState(false);
   async function submit(event: FormEvent) {
@@ -390,6 +510,14 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
         ),
       });
       beginClientSession();
+      if (mode === "login") {
+        try {
+          if (rememberUsername) localStorage.setItem("purevault-remembered-username", username);
+          else localStorage.removeItem("purevault-remembered-username");
+        } catch {
+          // Remembering the username is optional; authentication does not depend on storage.
+        }
+      }
       setPassword("");
       setConfirmation("");
       refresh();
@@ -460,6 +588,22 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
               </small>
             </div>
           )}
+          {mode === "login" && (
+            <label className="remember-username">
+              <input
+                type="checkbox"
+                checked={rememberUsername}
+                onChange={(event) => {
+                  const checked = event.target.checked;
+                  setRememberUsername(checked);
+                  if (!checked) {
+                    try { localStorage.removeItem("purevault-remembered-username"); } catch { /* optional storage */ }
+                  }
+                }}
+              />
+              <span>Remember username on this browser</span>
+            </label>
+          )}
           {error && (
             <p className="error" role="alert">
               {error}
@@ -487,18 +631,156 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
   );
 }
 
+const settingsTabs = [
+  { id: "display-time", label: "Display time" },
+  { id: "accountability-partners", label: "Accountability partners" },
+  { id: "email-notifications", label: "Email notifications" },
+] as const;
+
+function settingsHashIndex() {
+  return settingsTabs.findIndex(({ id }) => window.location.hash === `#${id}`);
+}
+
+function clearSettingsHash() {
+  if (settingsHashIndex() >= 0) {
+    window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
+  }
+}
+
+function TimezonePicker({ zone, onSelect, onDraftChange }: {
+  zone: string;
+  onSelect: (zone: string) => void;
+  onDraftChange: (draft: boolean) => void;
+}) {
+  const [query, setQuery] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+  const [active, setActive] = useState(-1);
+  const activeOption = useRef<HTMLLIElement>(null);
+  const zones = useMemo(() => ["UTC", ...(Intl.supportedValuesOf?.("timeZone") ?? [])], []);
+  const options = useMemo(() => {
+    const search = query?.trim().toLowerCase() ?? "";
+    return [...new Set([zone, ...zones])].filter((value) =>
+      `${value} ${zoneLabel(value)}`.toLowerCase().includes(search),
+    );
+  }, [query, zone, zones]);
+
+  useEffect(() => {
+    if (open) activeOption.current?.scrollIntoView({ block: "nearest" });
+  }, [active, open]);
+
+  function close() {
+    setOpen(false);
+    setActive(-1);
+  }
+
+  function select(value: string) {
+    onSelect(value);
+    setQuery(null);
+    onDraftChange(false);
+    close();
+  }
+
+  return (
+    <div className="field timezone-picker">
+      <label htmlFor="display-timezone">Timezone</label>
+      <input
+        id="display-timezone"
+        role="combobox"
+        aria-autocomplete="list"
+        aria-expanded={open}
+        aria-controls="timezone-options"
+        aria-activedescendant={open && options[active] ? `timezone-option-${active}` : undefined}
+        aria-describedby="timezone-hint"
+        autoComplete="off"
+        value={query ?? zoneLabel(zone)}
+        onFocus={(event) => {
+          if (query === null) event.target.select();
+          setOpen(true);
+        }}
+        onClick={(event) => {
+          if (query === null) event.currentTarget.select();
+          setOpen(true);
+        }}
+        onBlur={close}
+        onChange={(event) => {
+          setQuery(event.target.value);
+          onDraftChange(true);
+          setActive(-1);
+          setOpen(true);
+        }}
+        onKeyDown={(event) => {
+          if (event.nativeEvent.isComposing) return;
+          switch (event.key) {
+            case "ArrowDown":
+            case "ArrowUp":
+              event.preventDefault();
+              setOpen(true);
+              setActive((index) => {
+                if (!options.length) return -1;
+                if (!open || index < 0) return event.key === "ArrowDown" ? 0 : options.length - 1;
+                return Math.max(0, Math.min(options.length - 1, index + (event.key === "ArrowDown" ? 1 : -1)));
+              });
+              break;
+            case "Enter":
+              event.preventDefault();
+              if (open && options[active]) select(options[active]);
+              else setOpen(true);
+              break;
+            case "Escape":
+              if (query !== null || open) event.preventDefault();
+              setQuery(null);
+              onDraftChange(false);
+              close();
+              break;
+          }
+        }}
+      />
+      <div className="timezone-options" hidden={!open}>
+        <ul id="timezone-options" role="listbox" aria-label="Timezones">
+          {open && options.map((value, index) => (
+            <li
+              key={value}
+              id={`timezone-option-${index}`}
+              role="option"
+              aria-selected={value === zone}
+              className={index === active ? "active-option" : undefined}
+              ref={index === active ? activeOption : undefined}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => select(value)}
+            >
+              {zoneLabel(value)}
+            </li>
+          ))}
+        </ul>
+        {open && !options.length && <p role="status">No matching timezones.</p>}
+      </div>
+      <small id="timezone-hint" className="hint">Type a city or region, then choose a timezone from the list.</small>
+    </div>
+  );
+}
+
 function SettingsPanel({
   session,
+  now,
   onSessionSaved,
   onAccountability,
-  onClose,
 }: {
   session: Session;
+  now: Date;
   onSessionSaved: () => void;
   onAccountability: (value: AccountabilitySettings) => void;
-  onClose: () => void;
 }) {
+  const headingRef = useRef<HTMLHeadingElement>(null);
   const [zone, setZone] = useState(session.display_timezone);
+  const [zoneDraft, setZoneDraft] = useState(false);
+  const [pickerVersion, setPickerVersion] = useState(0);
+  const [activeTab, setActiveTab] = useState(() => Math.max(0, settingsHashIndex()));
+  function activateTab(index: number, focus = false) {
+    setActiveTab(index);
+    const id = settingsTabs[index].id;
+    window.history.replaceState(window.history.state, "", `#${id}`);
+    if (focus) document.getElementById(`tab-${id}`)?.focus();
+  }
   const [settings, setSettings] = useState<AccountabilitySettings | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -514,17 +796,12 @@ function SettingsPanel({
     port: "587",
     security: "starttls" as EmailConfiguration["security"],
     username: "",
-    password_action: "keep",
     password: "",
+    clear_password: false,
     from_email: "",
     from_name: "",
-    current_password: "",
   });
   const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  const supportedZones =
-    (
-      Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] }
-    ).supportedValuesOf?.("timeZone") || [];
   const load = useCallback(async (resetForm = false) => {
     const value = await api<AccountabilitySettings>("/accountability/");
     setSettings(value);
@@ -537,19 +814,20 @@ function SettingsPanel({
         port: String(value.email.port),
         security: value.email.security,
         username: value.email.username,
-        password_action: "keep",
         password: "",
+        clear_password: false,
         from_email: value.email.from_email,
         from_name: value.email.from_name,
-        current_password: "",
       }));
     }
   }, [onAccountability]);
   useEffect(() => {
     load(true).catch((err) => setError((err as Error).message));
   }, [load]);
+  useEffect(() => { headingRef.current?.focus(); }, []);
   async function saveTimezone(event: FormEvent) {
     event.preventDefault();
+    if (zoneDraft) return;
     setBusy(true);
     setError("");
     setNotice("");
@@ -633,7 +911,7 @@ function SettingsPanel({
     try {
       const result = await api<{ message: string }>("/accountability/email/test/", {
         method: "POST",
-        body: JSON.stringify({ destination: testDestination, current_password: emailForm.current_password }),
+        body: JSON.stringify({ destination: testDestination }),
       });
       setNotice(result.message);
       await load();
@@ -646,40 +924,56 @@ function SettingsPanel({
   const setEmail = (key: string, value: string | boolean) =>
     setEmailForm((current) => ({ ...current, [key]: value }));
   return (
-    <section className="panel settings-panel">
+    <section className="settings-page" aria-labelledby="settings-title">
       <div className="section-heading">
         <div>
           <p className="eyebrow">SETTINGS</p>
-          <h2>Vault settings</h2>
+          <h1 id="settings-title" ref={headingRef} tabIndex={-1}>Vault settings</h1>
         </div>
-        <button className="button ghost small" onClick={onClose}>Close</button>
       </div>
       {settings?.warning && <p className="warning" role="status">{settings.warning}</p>}
       {error && <p className="error" role="alert">{error}</p>}
       {notice && <p className="success" role="status">{notice}</p>}
 
-      <div className="settings-section">
+      <div className="settings-layout">
+        <div className="settings-nav" role="tablist" aria-orientation="vertical" aria-label="Settings sections">
+          {settingsTabs.map(({ id, label }, index) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`tab-${id}`}
+              aria-controls={id}
+              aria-selected={index === activeTab}
+              tabIndex={index === activeTab ? 0 : -1}
+              onClick={() => activateTab(index)}
+              onKeyDown={(event) => {
+                const count = settingsTabs.length;
+                let next: number;
+                switch (event.key) {
+                  case "ArrowUp": next = (index + count - 1) % count; break;
+                  case "ArrowDown": next = (index + 1) % count; break;
+                  case "Home": next = 0; break;
+                  case "End": next = count - 1; break;
+                  default: return;
+                }
+                event.preventDefault();
+                activateTab(next, true);
+              }}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+      <div className="settings-section" id="display-time" role="tabpanel" aria-labelledby="tab-display-time" hidden={activeTab !== 0}>
         <h3>Display timezone</h3>
         <form onSubmit={saveTimezone} className="timezone-form">
-        <div className="field">
-          <label htmlFor="display-timezone">Timezone</label>
-          <input
-            id="display-timezone"
-            list="timezone-options"
-            value={zone}
-            onChange={(e) => setZone(e.target.value)}
-            placeholder="Search timezones"
-            required
-          />
-          <datalist id="timezone-options">
-            <option value="UTC" />
-            {supportedZones.map((value) => (
-              <option value={value} key={value} />
-            ))}
-          </datalist>
-          <small className="hint">
-            Changes displayed times only; waiting periods stay the same.
-          </small>
+        <TimezonePicker key={pickerVersion} zone={zone} onSelect={setZone} onDraftChange={setZoneDraft} />
+        <div className="timezone-preview">
+          <span>Selected timezone</span>
+          <strong>{zoneLabel(zone)}</strong>
+          <time>{clockTime(now, zone)}</time>
+          <small>Display preference only; waiting periods and server timing are unchanged.</small>
         </div>
         <div className="suggestion">
           <span>
@@ -688,20 +982,24 @@ function SettingsPanel({
           <button
             type="button"
             className="button ghost small"
-            onClick={() => setZone(browserZone)}
+            onClick={() => {
+              setZone(browserZone);
+              setZoneDraft(false);
+              setPickerVersion((version) => version + 1);
+            }}
           >
             Use browser timezone
           </button>
         </div>
         <div className="form-actions">
-          <button className="button primary" disabled={busy}>
+          <button className="button primary" disabled={busy || zoneDraft}>
             {busy ? "Saving…" : "Save timezone"}
           </button>
         </div>
       </form>
       </div>
 
-      <div className="settings-section">
+      <div className="settings-section" id="accountability-partners" role="tabpanel" aria-labelledby="tab-accountability-partners" hidden={activeTab !== 1}>
         <div className="subheading">
           <div>
             <h3>Accountability partners</h3>
@@ -732,7 +1030,7 @@ function SettingsPanel({
         </form>
       </div>
 
-      <div className="settings-section">
+      <div className="settings-section" id="email-notifications" role="tabpanel" aria-labelledby="tab-email-notifications" hidden={activeTab !== 2}>
         <h3>Email notifications</h3>
         <p className="section-copy">Email is optional. If delivery fails, messages stay queued and retry; unlock timing never changes.</p>
         <form className="settings-grid" onSubmit={saveEmail}>
@@ -741,17 +1039,23 @@ function SettingsPanel({
           <div className="field"><label htmlFor="smtp-port">Port</label><input id="smtp-port" inputMode="numeric" value={emailForm.port} onChange={(e) => setEmail("port", e.target.value)} /><small className="hint">Usually 587 for STARTTLS or 465 for SSL/TLS.</small></div>
           <div className="field"><label htmlFor="smtp-security">Connection security</label><select id="smtp-security" value={emailForm.security} onChange={(e) => setEmail("security", e.target.value)}><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">Unencrypted (advanced/local relay)</option></select></div>
           <div className="field"><label htmlFor="smtp-user">SMTP username</label><input id="smtp-user" value={emailForm.username} maxLength={255} onChange={(e) => setEmail("username", e.target.value)} autoComplete="username" /><small className="hint">Leave username and password empty for a deliberate unauthenticated relay.</small></div>
-          <div className="field"><label htmlFor="password-action">SMTP password</label><select id="password-action" value={emailForm.password_action} onChange={(e) => setEmail("password_action", e.target.value)}><option value="keep">Keep saved password{settings?.email.password_set ? " (masked)" : ""}</option><option value="replace">Replace password</option><option value="clear">Clear password</option></select></div>
-          {emailForm.password_action === "replace" && <div className="field"><label htmlFor="smtp-password">New SMTP password</label><input id="smtp-password" type="password" value={emailForm.password} maxLength={1024} onChange={(e) => setEmail("password", e.target.value)} autoComplete="new-password" required /></div>}
+          <div className="field full">
+            <label htmlFor="smtp-password">SMTP password</label>
+            <div className="password-row">
+              <input id="smtp-password" type="password" value={emailForm.password} maxLength={1024} onChange={(e) => setEmailForm((current) => ({ ...current, password: e.target.value, clear_password: false }))} autoComplete="new-password" placeholder={settings?.email.password_set && !emailForm.clear_password ? "Saved password retained when blank" : "No saved password"} />
+              <button type="button" className="button danger" disabled={!settings?.email.password_set || emailForm.clear_password} onClick={() => setEmailForm((current) => ({ ...current, username: "", password: "", clear_password: true }))}>Remove saved password</button>
+            </div>
+            <small className="hint">Blank keeps the saved password. New text replaces it. Removing it also clears the username for an unauthenticated relay. Changing the server, port, security, or username requires a replacement password or explicit removal.</small>
+            {emailForm.clear_password && <small className="warning compact">The saved SMTP password and username will be removed when you save.</small>}
+          </div>
           <div className="field"><label htmlFor="from-email">From email</label><input id="from-email" type="email" value={emailForm.from_email} maxLength={254} onChange={(e) => setEmail("from_email", e.target.value)} /></div>
           <div className="field"><label htmlFor="from-name">From name (optional)</label><input id="from-name" value={emailForm.from_name} maxLength={100} onChange={(e) => setEmail("from_name", e.target.value)} /></div>
-          <div className="field full"><label htmlFor="email-master">Current master password</label><input id="email-master" type="password" value={emailForm.current_password} onChange={(e) => setEmail("current_password", e.target.value)} autoComplete="current-password" required /></div>
           <div className="form-actions full"><button className="button primary" disabled={busy}>Save email settings</button></div>
         </form>
         <form className="test-form" onSubmit={sendTest}>
           <div className="field"><label htmlFor="test-destination">Test destination</label><input id="test-destination" type="email" value={testDestination} onChange={(e) => setTestDestination(e.target.value)} placeholder="recipient@example.com" required /></div>
           <button className="button secondary" disabled={busy || !settings?.email.enabled}>Send test email</button>
-          <small className="hint full">Uses the current master password above. “Accepted by mail server” does not guarantee inbox delivery.</small>
+          <small className="hint full">“Accepted by mail server” does not guarantee inbox delivery.</small>
         </form>
         <div className="queue-status" aria-live="polite">
           <span><strong>{settings?.queue.pending || 0}</strong> pending</span>
@@ -761,6 +1065,7 @@ function SettingsPanel({
           <button type="button" className="button ghost small" onClick={() => load()}>Refresh</button>
         </div>
         {settings?.queue.latest_error && <p className="warning">{settings.queue.latest_error}</p>}
+      </div>
       </div>
     </section>
   );
@@ -773,7 +1078,7 @@ function App() {
   const [error, setError] = useState(""),
     [showCreate, setShowCreate] = useState(false),
     [editing, setEditing] = useState<Entry | null>(null),
-    [showSettings, setShowSettings] = useState(false),
+    [showSettings, setShowSettings] = useState(() => settingsHashIndex() >= 0),
     [unlocking, setUnlocking] = useState<Entry | null>(null),
     [unlockReason, setUnlockReason] = useState(""),
     [unlockError, setUnlockError] = useState("");
@@ -797,6 +1102,7 @@ function App() {
       setShowCreate(false);
       setEditing(null);
       setShowSettings(false);
+      clearSettingsHash();
       setUnlocking(null);
       setUnlockReason("");
       setUnlockError("");
@@ -865,13 +1171,14 @@ function App() {
       loadEntries();
       loadAccountability();
     }
-    else {
+    else if (session?.authenticated === false) {
       setEntries([]);
       setRevealed({});
       setAccountability(null);
       setShowCreate(false);
       setEditing(null);
       setShowSettings(false);
+      clearSettingsHash();
       setUnlocking(null);
       setUnlockReason("");
       setUnlockError("");
@@ -891,6 +1198,19 @@ function App() {
       clearInterval(sync);
     };
   }, [session?.authenticated, loadEntries]);
+  useEffect(() => {
+    const current = editing ? entries.find((entry) => entry.id === editing.id) : null;
+    const expiredLocally = current?.status === "available" && remainingSeconds(current, nowPerformance) === 0;
+    if (editing && (!current || current.status !== "available" || expiredLocally)) {
+      setEditing(null);
+      setShowCreate(false);
+      setRevealed((values) => {
+        const next = { ...values };
+        delete next[editing.id];
+        return next;
+      });
+    }
+  }, [editing, entries, nowPerformance]);
   useEffect(() => {
     if (!session?.authenticated) return;
     let lastAcknowledgedAt = Number.NEGATIVE_INFINITY;
@@ -954,6 +1274,17 @@ function App() {
       return false;
     }
   }
+  const closeEntryEditor = () => {
+    if (editing) {
+      setRevealed((current) => {
+        const next = { ...current };
+        delete next[editing.id];
+        return next;
+      });
+    }
+    setShowCreate(false);
+    setEditing(null);
+  };
   const available = useMemo(
     () => entries.filter((e) => e.status === "available").length,
     [entries],
@@ -961,18 +1292,56 @@ function App() {
   if (!session) return <div className="loading">Opening Purevault…</div>;
   if (!session.authenticated)
     return <Auth session={session} refresh={loadSession} />;
+  const currentServerDate = new Date(
+    serverSync.epochMs + (nowPerformance - serverSync.performanceMs),
+  );
+  const returnToVault = () => {
+    clearSettingsHash();
+    if (!showSettings) {
+      window.scrollTo(0, 0);
+      return;
+    }
+    setShowSettings(false);
+    window.scrollTo(0, 0);
+    window.requestAnimationFrame(() => document.getElementById("settings-button")?.focus());
+  };
+  const wordmark = (
+    <button type="button" className="brand brand-button" aria-label="Purevault dashboard" onClick={returnToVault}>
+      <span className="brand-mark" aria-hidden="true">P</span>
+      <span>Purevault</span>
+    </button>
+  );
+  if (showSettings) {
+    return (
+      <>
+        <header className="topbar">
+          {wordmark}
+          <div className="account">
+            <span>{session.username}</span>
+            <button className="button ghost small" onClick={async () => { try { await api("/logout/", { method: "POST", body: "{}" }); } finally { endClientSession({ reason: "explicit" }); } }}>Sign out</button>
+          </div>
+        </header>
+        <main className="settings-shell">
+          <SettingsPanel
+            session={session}
+            now={currentServerDate}
+            onSessionSaved={loadSession}
+            onAccountability={acceptAccountability}
+          />
+        </main>
+      </>
+    );
+  }
   return (
     <>
       <header className="topbar">
-        <div className="brand">
-          <span className="brand-mark">P</span>
-          <span>Purevault</span>
-        </div>
+        {wordmark}
         <div className="account">
           <span>{session.username}</span>
           <button
+            id="settings-button"
             className="button ghost small"
-            onClick={() => setShowSettings((value) => !value)}
+            onClick={() => { closeEntryEditor(); window.scrollTo(0, 0); setShowSettings(true); }}
           >
             Settings
           </button>
@@ -1025,32 +1394,11 @@ function App() {
             <strong>{available}</strong>
             <span>Available</span>
           </div>
-          <div className="clock">
-            <span>Server time · UTC</span>
-            <strong>
-              {new Date(
-                serverSync.epochMs +
-                  (nowPerformance - serverSync.performanceMs),
-              )
-                .toISOString()
-                .replace("T", " ")
-                .slice(0, 19)}
-            </strong>
-            <small>Display zone: {session.display_timezone}</small>
-          </div>
         </section>
         {error && (
           <p className="error banner" role="alert">
             {error}
           </p>
-        )}
-        {showSettings && (
-          <SettingsPanel
-            session={session}
-            onSessionSaved={loadSession}
-            onAccountability={acceptAccountability}
-            onClose={() => setShowSettings(false)}
-          />
         )}
         {unlocking && (
           <div className="dialog-backdrop" role="presentation">
@@ -1097,15 +1445,12 @@ function App() {
               </div>
             </div>
             <EntryForm
+              key={editing ? `edit-${editing.id}` : "create"}
               editing={editing}
-              onCancel={() => {
-                setShowCreate(false);
-                setEditing(null);
-              }}
+              onCancel={closeEntryEditor}
               onCreated={(entry) => {
                 replace(entry);
-                setShowCreate(false);
-                setEditing(null);
+                closeEntryEditor();
               }}
             />
           </section>
@@ -1241,9 +1586,17 @@ function App() {
                           </button>
                           <button
                             className="button ghost"
-                            onClick={() => setEditing(entry)}
+                            onClick={() => {
+                              setShowCreate(false);
+                              setRevealed((current) => {
+                                const next = { ...current };
+                                delete next[entry.id];
+                                return next;
+                              });
+                              setEditing(entry);
+                            }}
                           >
-                            Edit & relock
+                            Edit
                           </button>
                         </>
                       )}
@@ -1254,7 +1607,11 @@ function App() {
             </div>
           )}
         </section>
-        <footer>
+        <footer className="vault-footer">
+          <div className="footer-clock">
+            <time dateTime={currentServerDate.toISOString()}>{clockTime(currentServerDate, session.display_timezone)}</time>
+            <span>{zoneLabel(session.display_timezone)}</span>
+          </div>
           <p>
             Waiting periods count only while Purevault is running. Automatic
             access locks again after an interrupted restart. Anyone controlling

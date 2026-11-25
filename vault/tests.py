@@ -142,6 +142,9 @@ class VaultSecurityTests(RuntimeClockMixin, TestCase):
         grant = UnlockGrant.objects.get(entry=self.entry)
         self.assertEqual(grant.eligible_runtime_ms - RuntimeClock.objects.get(pk=1).elapsed_milliseconds, 30000)
         self.set_runtime(60)
+        self.entry.relock_policy = "manual"
+        self.entry.relock_after_seconds = None
+        self.entry.save(update_fields=["relock_policy", "relock_after_seconds"])
         os.environ["PUREVAULT_CLOCK_GENERATION"] = new_generation
         initialize_runtime_clock(monotonic_ns=BASE_NS + 2_000_000_000_000, generation="newer-generation")
         self.assertFalse(UnlockGrant.objects.filter(entry=self.entry).exists())
@@ -180,18 +183,53 @@ class VaultSecurityTests(RuntimeClockMixin, TestCase):
         data["owner"]=self.other.id
         self.assertEqual(self.post("/api/entries/",data).status_code,400)
 
+    def test_waiting_edit_cannot_shortcut_the_original_delay(self):
+        self.start(); self.set_runtime(30)
+        data={"title":"Changed","password":"","unlock_delay":"1","unlock_unit":"seconds","relock_policy":"manual","relock_after":"1","relock_unit":"seconds","relock":False}
+        with self.mono(30):
+            response = self.client.put(f"/api/entries/{self.entry.id}/", data=json.dumps(data), content_type="application/json")
+        self.assertEqual(response.status_code, 423)
+        grant = UnlockGrant.objects.get(entry=self.entry)
+        self.assertEqual(grant.eligible_runtime_ms, 60000)
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.unlock_delay_seconds, 60)
+
     def test_invalid_duration_bounds_are_rejected(self):
         for value in ["0","-1","1.5","NaN",str(366*86400)]:
             response=self.post("/api/entries/",{"title":"Example","password":"neutral-test-secret","unlock_delay":value,"unlock_unit":"seconds","relock_policy":"manual"})
             self.assertEqual(response.status_code,400,value)
 
-    def test_edit_rechecks_inside_transaction_and_relocks(self):
+    def test_edit_save_preserves_grant_and_unchanged_password(self):
         self.start(); self.set_runtime(60)
         with self.mono(60):
-            updated=update_entry_if_available(self.entry,self.user,encrypted_secret=encrypt_secret("replacement"),values={"title":"Updated","unlock_delay_seconds":90,"relock_policy":"manual","relock_after_seconds":None})
-        self.assertEqual(updated.title,"Updated"); self.assertFalse(UnlockGrant.objects.filter(entry=updated).exists())
-        with self.mono(60), self.assertRaises(EntryNotAvailable):
-            update_entry_if_available(updated,self.user,encrypted_secret=encrypt_secret("again"),values={"title":"Again","unlock_delay_seconds":1,"relock_policy":"manual","relock_after_seconds":None})
+            response = self.client.put(f"/api/entries/{self.entry.id}/", data=json.dumps({"title":"Updated","password":"","unlock_delay":"90","unlock_unit":"seconds","relock_policy":"manual","relock_after":"1","relock_unit":"seconds","relock":False}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        updated = VaultEntry.objects.get(pk=self.entry.pk)
+        grant = UnlockGrant.objects.get(entry=updated)
+        self.assertEqual(updated.title, "Updated")
+        self.assertEqual(grant.access_until_runtime_ms, 90000)
+        self.assertEqual(response.json()["entry"]["status"], "available")
+        with self.mono(60): self.assertEqual(release_secret(updated)[0], "<tag>&9 ! exact")
+        self.set_runtime(90)
+        with self.mono(90):
+            self.assertEqual(release_secret(updated), (None, "locked"))
+            expired_edit = self.client.put(f"/api/entries/{updated.id}/", data=json.dumps({"title":"Too late","password":"","unlock_delay":"1","unlock_unit":"seconds","relock_policy":"manual","relock_after":"1","relock_unit":"seconds","relock":False}), content_type="application/json")
+            self.assertEqual(expired_edit.status_code, 423)
+            self.assertEqual(self.post(f"/api/entries/{updated.id}/reveal/").status_code, 423)
+
+    def test_edit_save_and_relock_is_atomic_and_replacement_is_optional(self):
+        self.start(); self.set_runtime(60)
+        with self.mono(60):
+            response = self.client.put(f"/api/entries/{self.entry.id}/", data=json.dumps({"title":"Updated","password":"replacement","unlock_delay":"2","unlock_unit":"minutes","relock_policy":"automatic","relock_after":"45","relock_unit":"seconds","relock":True}), content_type="application/json")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["entry"]["status"], "locked")
+        self.assertFalse(UnlockGrant.objects.filter(entry=self.entry).exists())
+        self.set_runtime(61)
+        with self.mono(61):
+            self.assertEqual(start_unlock(VaultEntry.objects.get(pk=self.entry.pk))[1].eligible_runtime_ms, 181000)
+        self.set_runtime(181)
+        with self.mono(181):
+            self.assertEqual(release_secret(VaultEntry.objects.get(pk=self.entry.pk))[0], "replacement")
 
     def test_staff_flags_do_not_bypass(self):
         self.user.is_staff=True; self.user.is_superuser=True; self.user.save()
@@ -505,7 +543,7 @@ class AccountabilityTests(RuntimeClockMixin, TestCase):
         self.assertTrue(MailDelivery.objects.filter(event_type="partner_removed", recipient_email="new@example.com").exists())
 
     def test_smtp_password_encrypted_masked_and_validation(self):
-        payload = {"enabled": True, "host": "smtp.example.com", "port": 587, "security": "starttls", "username": "mailer", "password_action": "replace", "password": "synthetic-smtp-password", "from_email": "vault@example.com", "from_name": "Purevault", "current_password": "long-neutral-test-password"}
+        payload = {"enabled": True, "host": "smtp.example.com", "port": 587, "security": "starttls", "username": "mailer", "password": "synthetic-smtp-password", "clear_password": False, "from_email": "vault@example.com", "from_name": "Purevault"}
         response = self.client.put("/api/accountability/email/", data=json.dumps(payload), content_type="application/json")
         self.assertEqual(response.status_code, 200)
         configuration = EmailSettings.objects.get(owner=self.user)
@@ -513,10 +551,17 @@ class AccountabilityTests(RuntimeClockMixin, TestCase):
         for body in [response.content, self.client.get("/api/accountability/").content]:
             self.assertNotIn(b"synthetic-smtp-password", body); self.assertNotIn(b"encrypted_password", body)
         self.assertTrue(response.json()["email"]["password_set"])
-        half = {**payload, "username": "mailer", "password_action": "clear", "password": ""}
+        half = {**payload, "username": "mailer", "clear_password": True, "password": ""}
         self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(half), content_type="application/json").status_code, 400)
         injected = {**half, "username": "", "host": "smtp.example.com\r\nBcc: attacker@example.com"}
         self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(injected), content_type="application/json").status_code, 400)
+        legacy_reauth = {**payload, "current_password": "long-neutral-test-password"}
+        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(legacy_reauth), content_type="application/json").status_code, 400)
+        cleared = {**payload, "username": "", "password": "", "clear_password": True}
+        cleared_response = self.client.put("/api/accountability/email/", data=json.dumps(cleared), content_type="application/json")
+        self.assertEqual(cleared_response.status_code, 200)
+        self.assertFalse(cleared_response.json()["email"]["password_set"])
+        self.assertEqual(EmailSettings.objects.get(owner=self.user).username, "")
 
     def test_mail_failure_does_not_change_unlock_timing(self):
         self.partner()
@@ -530,12 +575,14 @@ class AccountabilityTests(RuntimeClockMixin, TestCase):
 
     def test_configuration_change_notice_prefers_previous_transport(self):
         self.partner()
-        first = {"enabled": True, "host": "old.example.com", "port": 587, "security": "starttls", "username": "mailer", "password_action": "replace", "password": "old-synthetic-password", "from_email": "vault@example.com", "from_name": "Purevault", "current_password": "long-neutral-test-password"}
+        first = {"enabled": True, "host": "old.example.com", "port": 587, "security": "starttls", "username": "mailer", "password": "old-synthetic-password", "clear_password": False, "from_email": "vault@example.com", "from_name": "Purevault"}
         self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(first), content_type="application/json").status_code, 200)
         MailDelivery.objects.all().delete()
         delayed = queue_delivery(owner=self.user, event_id=uuid.uuid4(), event_type=MailDelivery.EventType.TEST, recipient_name="Recipient", recipient_email="recipient@example.com", subject="Purevault: test", body="Synthetic test")
         MailDelivery.objects.filter(pk=delayed.pk).update(next_attempt_at=timezone.now() + timedelta(hours=1), needs_attention=True, last_error="Synthetic prior failure")
-        second = {**first, "host": "new.example.com", "password_action": "keep", "password": ""}
+        unsafe_reuse = {**first, "host": "new.example.com", "password": ""}
+        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(unsafe_reuse), content_type="application/json").status_code, 400)
+        second = {**unsafe_reuse, "password": "new-synthetic-password"}
         self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(second), content_type="application/json").status_code, 200)
         delayed.refresh_from_db()
         self.assertLessEqual(delayed.next_attempt_at, timezone.now())
@@ -642,9 +689,9 @@ class MailDeliveryTests(RuntimeClockMixin, TestCase):
     def test_test_email_rate_limit_and_sanitized_provider_error(self):
         self.configure(); client = Client(); force_login_active(client, self.user)
         for index in range(3):
-            response = client.post("/api/accountability/email/test/", data=json.dumps({"destination": f"recipient{index}@example.com", "current_password": "neutral-mail-password"}), content_type="application/json")
+            response = client.post("/api/accountability/email/test/", data=json.dumps({"destination": f"recipient{index}@example.com"}), content_type="application/json")
             self.assertEqual(response.status_code, 202)
-        limited = client.post("/api/accountability/email/test/", data=json.dumps({"destination": "fourth@example.com", "current_password": "neutral-mail-password"}), content_type="application/json")
+        limited = client.post("/api/accountability/email/test/", data=json.dumps({"destination": "fourth@example.com"}), content_type="application/json")
         self.assertEqual(limited.status_code, 429)
         delivery = MailDelivery.objects.first()
         MailDelivery.objects.filter(pk=delivery.pk).update(next_attempt_at=timezone.now())

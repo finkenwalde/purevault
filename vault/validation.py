@@ -32,8 +32,8 @@ def validate_entry_payload(data, *, editing=False):
     password = data.get("password")
     if not isinstance(title, str) or not title.strip() or len(title.strip()) > 200:
         raise ValidationError("Title is required and must be at most 200 characters.")
-    if not isinstance(password, str) or not password or len(password) > 4096:
-        raise ValidationError("Password is required and must be at most 4096 characters.")
+    if not isinstance(password, str) or len(password) > 4096 or (not editing and not password):
+        raise ValidationError("Password is required and must be at most 4096 characters." if not editing else "Replacement password must be at most 4096 characters.")
     delay = parse_duration(data.get("unlock_delay"), data.get("unlock_unit"), maximum=MAX_UNLOCK_DELAY_SECONDS, field_name="Unlock delay")
     policy = data.get("relock_policy", "automatic")
     if policy not in {"automatic", "manual"}:
@@ -41,5 +41,5 @@ def validate_entry_payload(data, *, editing=False):
     relock_after = None
     if policy == "automatic":
         relock_after = parse_duration(data.get("relock_after"), data.get("relock_unit"), maximum=MAX_RELOCK_SECONDS, field_name="Automatic relock window")
-    return {"title": title.strip(), "password": password, "unlock_delay_seconds": delay, "relock_policy": policy, "relock_after_seconds": relock_after}
+    return {"title": title.strip(), "password": password or None, "unlock_delay_seconds": delay, "relock_policy": policy, "relock_after_seconds": relock_after}
 

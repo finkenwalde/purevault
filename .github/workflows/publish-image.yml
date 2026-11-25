@@ -1,0 +1,128 @@
+name: Publish container image
+
+on:
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/finkenwalde/purevault
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-container-main
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify clean source
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require the main branch
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Container publication is allowed only from main." >&2
+            exit 1
+          fi
+
+      - name: Check out the selected commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build the production image
+        run: docker build --platform linux/amd64 --tag purevault:verify .
+
+      - name: Run backend tests with temporary storage
+        run: >-
+          docker run --rm --user root --entrypoint python
+          --mount type=tmpfs,destination=/data
+          --mount type=tmpfs,destination=/keys
+          --env PUREVAULT_DJANGO_SECRET_KEY=github-actions-test-only
+          --env PUREVAULT_DATA_DIR=/data
+          --env PUREVAULT_KEY_FILE=/keys/app.key
+          purevault:verify manage.py test
+
+  publish:
+    name: Publish linux/amd64 image
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out the verified commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Build from the checked-out source
+        shell: bash
+        run: |
+          docker build \
+            --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --tag "${IMAGE_NAME}:${GITHUB_SHA}" \
+            --tag "${IMAGE_NAME}:latest" \
+            .
+
+      - name: Test the exact image to be pushed
+        run: >-
+          docker run --rm --user root --entrypoint python
+          --mount type=tmpfs,destination=/data
+          --mount type=tmpfs,destination=/keys
+          --env PUREVAULT_DJANGO_SECRET_KEY=github-actions-publish-test-only
+          --env PUREVAULT_DATA_DIR=/data
+          --env PUREVAULT_KEY_FILE=/keys/app.key
+          "${IMAGE_NAME}:${GITHUB_SHA}" manage.py test
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the commit tag and capture its digest
+        id: push_commit
+        shell: bash
+        run: |
+          set +e
+          push_output="$(docker push "${IMAGE_NAME}:${GITHUB_SHA}" 2>&1)"
+          push_status=$?
+          set -e
+          printf '%s\n' "${push_output}"
+          if [[ ${push_status} -ne 0 ]]; then
+            exit "${push_status}"
+          fi
+          digest="$(printf '%s\n' "${push_output}" | sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' | tail -n 1)"
+          if [[ -z "${digest}" ]]; then
+            echo "The registry push did not report an image digest." >&2
+            exit 1
+          fi
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Record the immutable image digest
+        env:
+          PUBLISHED_DIGEST: ${{ steps.push_commit.outputs.digest }}
+        shell: bash
+        run: |
+          {
+            echo "## Published container image"
+            echo
+            echo "- Source commit: \`${GITHUB_SHA}\`"
+            echo "- Immutable image: \`${IMAGE_NAME}@${PUBLISHED_DIGEST}\`"
+            echo "- Published source tag: \`${IMAGE_NAME}:${GITHUB_SHA}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Push the latest tag
+        run: docker push "${IMAGE_NAME}:latest"
+
+      - name: Record the latest tag update
+        shell: bash
+        run: |
+          echo "- Updated moving tag: \`${IMAGE_NAME}:latest\`" >> "${GITHUB_STEP_SUMMARY}"

@@ -2,6 +2,8 @@
 
 Purevault is a self-hosted delayed-access password vault. It inserts a server-enforced waiting period between an unlock request and secret availability, with automatic or manual relocking.
 
+Purevault is a heavily AI-assisted coding project. The author works in IT and has basic programming knowledge.
+
 ## Quick start on your computer
 
 This quick start runs Purevault only on the same computer as Docker. It is not a guide for public or remote hosting.
@@ -61,6 +63,17 @@ Your account, entries, and encryption key are kept in Docker volumes and survive
 
 If something does not start, open Docker Desktop's **Containers** view, expand **purevault**, and read the `web` logs. Check that Docker Desktop is running and port `8080` is free.
 
+## How Purevault works
+
+The backend uses **Django**, a Python web framework, for sign-in, data storage, and enforcement of unlock delays. Gunicorn runs the Django app, SQLite stores the vault data, and React provides the browser interface.
+
+- **Sign-in and sessions.** Django hashes the master password, manages session cookies, and protects requests that change vault data with CSRF checks. Sessions expire after 10 minutes of inactivity.
+- **Vault encryption.** Saved passwords are encrypted with Fernet. The database and its encryption key are kept in separate Docker volumes.
+- **Unlock delays.** The server checks each request to reveal a password. It measures elapsed time while Purevault is running, so changing the browser clock cannot shorten the wait.
+- **Portable backups.** Backup files are encrypted and protected by a separate recovery passphrase. Restored entries start locked and require their full delay.
+
+Anyone who controls the Docker host can bypass the app's controls. Anyone with both a backup file and its recovery passphrase can also decrypt it outside Purevault. For details, see the [architecture and security boundary](docs/ARCHITECTURE.md).
+
 ## Other installation and maintenance options
 
 Use [portable encrypted backups](docs/BACKUPS.md) to download an off-host recovery copy or restore into an empty installation.
@@ -72,8 +85,6 @@ See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 - backup and restore guidance;
 - configuration and remote HTTPS considerations;
 - development and test commands.
-
-For implementation details, timing behavior, and the full security model, see [Purevault architecture and security boundary](docs/ARCHITECTURE.md).
 
 See the [sequential feature roadmap](docs/ROADMAP.md) for approved work that will be implemented and reviewed one feature at a time.
 

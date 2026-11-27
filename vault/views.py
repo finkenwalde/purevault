@@ -11,19 +11,18 @@ from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig, ValidationError
 from django.db import OperationalError
-from django.http import FileResponse, Http404, JsonResponse
+from django.http import Http404, JsonResponse
 from django.http.multipartparser import MultiPartParserError
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
-from vault import backups
-from vault.backup_format import MAX_FILE_BYTES, InvalidBackup, create_recovery_bundle, unpack_backup
+from vault.backup_format import MAX_FILE_BYTES, InvalidBackup, unpack_backup
 from vault.crypto import encrypt_secret
-from vault.models import BackupSettings, RuntimeClock, UserProfile, VaultEntry
+from vault.models import RuntimeClock, UserProfile, VaultEntry
 from vault.services import MAX_TRUSTED_CLOCK_GAP_MS
-from vault.services import ClockUnavailable, EntryNotAvailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, setup_is_complete, start_unlock, update_entry_if_available
+from vault.services import ClockUnavailable, EntryNotAvailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, restore_entries, setup_is_complete, start_unlock, update_entry_if_available
 from vault.session_activity import session_activity_is_valid, stamp_session_activity
 from vault.validation import validate_entry_payload
 
@@ -114,7 +113,7 @@ def health(request):
 
 @ensure_csrf_cookie
 def app_shell(request, path=""):
-    if request.path.startswith("/api/"):
+    if request.path_info == "/api" or request.path_info.startswith("/api/"):
         raise Http404
     return render(request, "index.html")
 
@@ -365,91 +364,6 @@ def _correct_master_password(user, value):
 
 
 @api_login_required
-@require_http_methods(["GET", "PUT"])
-def backup_settings(request):
-    owner_id = request.user.pk
-    if request.method == "PUT":
-        try:
-            data = _json_body(request)
-            if set(data) - {"interval_days", "retention", "passphrase", "confirmation", "current_password"}:
-                raise ValidationError("Unsupported backup setting.")
-            interval, retention = data.get("interval_days"), data.get("retention")
-            if type(interval) is not int or interval not in (0, 1, 7):
-                raise ValidationError("Choose no schedule, every 24 hours, or every 7 days.")
-            if type(retention) is not int or not 1 <= retention <= 30:
-                raise ValidationError("Choose a retention count from 1 to 30.")
-            bundle = None
-            if set(data) & {"passphrase", "confirmation", "current_password"}:
-                master = data.get("current_password")
-                if not _correct_master_password(request.user, master):
-                    return _error("Current master password is incorrect.", 403)
-                phrase = data.get("passphrase")
-                if not isinstance(phrase, str) or not 20 <= len(phrase.strip()) <= len(phrase) <= 256:
-                    raise ValidationError("Use a strong recovery passphrase of 20 to 256 characters.")
-                if phrase == master:
-                    raise ValidationError("Choose a recovery passphrase separate from your master password.")
-                validate_password(phrase, user=request.user)
-                if phrase != data.get("confirmation"):
-                    raise ValidationError("The recovery passphrases do not match.")
-                bundle = create_recovery_bundle(phrase)
-            if not backups.configure(owner_id, interval, retention, bundle):
-                return _error("Set a recovery passphrase first.")
-        except ValidationError as exc:
-            return _error(exc)
-        except InvalidBackup:
-            return _error("The recovery passphrase could not be used.")
-        except OperationalError:
-            return _error(BACKUP_BUSY, 409)
-    profile = BackupSettings.objects.filter(owner_id=owner_id).first()
-    try:
-        files = [{"name": path.name, "bytes": path.stat().st_size} for path in backups.backup_files(owner_id)]
-    except OSError:
-        return _error("Backup storage is temporarily unavailable.", 503)
-    return JsonResponse({
-        "configured": profile is not None,
-        "interval_days": profile.interval_days if profile else 0,
-        "retention": profile.retention if profile else 7,
-        "next_run_at": _iso(profile.next_run_at) if profile else None,
-        "last_success_at": _iso(profile.last_success_at) if profile else None,
-        "last_error": profile.last_error if profile else "",
-        "running": bool(profile and profile.lease_until and profile.lease_until > timezone.now()),
-        "files": files,
-    })
-
-
-@api_login_required
-@require_POST
-def backup_now(request):
-    try:
-        if _json_body(request):
-            raise ValidationError("Backup now does not accept fields.")
-        if not BackupSettings.objects.filter(owner=request.user).exists():
-            return _error("Set a recovery passphrase first.")
-        if not backups.run_backup(request.user.pk):
-            return _error(BACKUP_BUSY, 409)
-        return JsonResponse({"ok": True}, status=201)
-    except ValidationError as exc:
-        return _error(exc)
-    except OperationalError:
-        return _error(BACKUP_BUSY, 409)
-    except InvalidBackup:
-        return _error(backups.BACKUP_FAILURE, 503)
-
-
-@api_login_required
-@require_GET
-def backup_download(request, name):
-    try:
-        path = backups.backup_path(request.user.pk, name)
-        if path is None:
-            raise Http404
-        handle = path.open("rb")
-    except OSError as exc:
-        raise Http404 from exc
-    return FileResponse(handle, as_attachment=True, filename=name, content_type="application/octet-stream")
-
-
-@api_login_required
 @require_POST
 def backup_restore(request):
     try:
@@ -465,7 +379,7 @@ def backup_restore(request):
         if upload.size > MAX_FILE_BYTES:
             return _error("Upload a Purevault backup file up to 12 MiB.", 413)
         zone, entries = unpack_backup(upload.read(MAX_FILE_BYTES + 1), request.POST["passphrase"])
-        if not backups.restore_entries(request.user.pk, zone, entries):
+        if not restore_entries(request.user.pk, zone, entries):
             return _error(RESTORE_EMPTY, 409)
         return JsonResponse({"restored": len(entries)})
     except (InvalidBackup, RequestDataTooBig, MultiPartParserError):

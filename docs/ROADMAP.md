@@ -26,6 +26,4 @@ Add a cryptographically secure generator for entry creation with configurable le
 
 Add a simple Trash workflow with automatic permanent deletion after 30 days. Moving an entry to Trash cancels its pending grant; trashed entries cannot be unlocked or revealed. Restoring an entry returns it locked and requires a fresh full delay. Permanent deletion requires explicit confirmation and the current master password. Safe purge scheduling and retention details must be finalized during this item.
 
-Portable encrypted backups are implemented separately. See [the recovery guide](BACKUPS.md).
-
 There is no Archive feature in this roadmap.

@@ -1,10 +1,10 @@
 # Purevault deployment and maintenance
 
-Use the [source-build quick start](../README.md#quick-start-on-your-computer) until the first public image is available. Both installation methods keep access local by default and store the vault and encryption key in Docker volumes.
+Use the prebuilt image below for a quick install, or follow the [source-build quick start](../README.md#quick-start-on-your-computer). Both methods keep access local by default and store the vault and encryption key in Docker volumes.
 
 ## Prebuilt image quick start
 
-Once the public image is available, save [`compose.image.yaml`](../compose.image.yaml). Open a terminal in the folder where you saved it and run:
+Save [`compose.image.yaml`](../compose.image.yaml). Open a terminal in the folder where you saved it and run:
 
 ```powershell
 docker compose -f compose.image.yaml up -d --pull always
@@ -14,12 +14,14 @@ Open [http://127.0.0.1:8080](http://127.0.0.1:8080) on the Docker host. If your 
 
 ### Deploy with Portainer
 
-Once the image is public, use a Docker Standalone environment in Portainer.
+Use a Docker Standalone environment in Portainer.
 
 1. Open **Stacks → Add stack** and enter `purevault` as the stack name.
 2. Select **Web editor** and paste the contents of [`compose.image.yaml`](../compose.image.yaml).
 3. Click **Deploy the stack**.
 4. Open [http://127.0.0.1:8080](http://127.0.0.1:8080) on the Docker host and create your account. For a separate Docker server, use the [SSH tunnel instructions](#remote-and-https-deployment) to open first-run setup from your computer.
+
+If you get **400 Bad Request** when connecting by the Docker host's IP address or hostname, add that address to [`PUREVAULT_ALLOWED_HOSTS`](../README.md#environment-variables) in the stack editor and update the stack.
 
 See the [Portainer stack guide](https://docs.portainer.io/user/docker/stacks/add#option-1-web-editor).
 
@@ -29,7 +31,7 @@ See the [Portainer stack guide](https://docs.portainer.io/user/docker/stacks/add
 | --- | --- |
 | `image` | Pulls Purevault from GitHub Container Registry. The published image targets `linux/amd64` (64-bit Intel and AMD). Docker can select it on a matching host without a `platform` setting. |
 | `ports` | Keeps setup and sign-in reachable only from the Docker host by default. A bare `8080:8080` opens the port on every host interface. |
-| `purevault_data:/data` | Stores the vault database, settings, and locally saved backups. |
+| `purevault_data:/data` | Stores the vault database, settings, and Django signing key. |
 | `purevault_keys:/keys` | Stores the encryption key needed to read saved passwords. Keep this volume with the matching data volume when moving or backing up an installation. |
 | `restart` | Starts Purevault again after Docker restarts unless you stopped Purevault yourself. |
 | `security_opt` | Prevents a program inside Purevault's container from gaining extra privileges when it starts another program. |
@@ -72,14 +74,14 @@ The named volumes survive stopping or removing the container. Do not delete them
 
 The standalone Docker Run example uses volumes named `purevault_data` and `purevault_keys`. A Compose installation normally uses `purevault_purevault_data` and `purevault_purevault_keys`. Switching between these deployment methods does not automatically reuse the same vault; do not switch methods as an update procedure.
 
-After a public port-8080 GHCR build is verified, the equivalent image pull and Docker Run command is:
+To run the prebuilt image with Docker Run:
 
 ```powershell
 docker pull ghcr.io/finkenwalde/purevault:latest
 docker run -d --name purevault-web --restart unless-stopped -p 127.0.0.1:8080:8080 --mount source=purevault_data,target=/data --mount source=purevault_keys,target=/keys --security-opt no-new-privileges --cap-drop ALL ghcr.io/finkenwalde/purevault:latest
 ```
 
-Do not use those commands before the package is public and an anonymous pull has succeeded. For an existing Compose installation, use the carefully documented `compose.image.yaml` procedure instead of changing to the standalone Docker Run volume names.
+For an existing Compose installation, use the [prebuilt image quick start](#prebuilt-image-quick-start) to reuse the same volumes.
 
 ## Status and logs
 
@@ -95,13 +97,13 @@ The internal `/health/` endpoint reports status only. Docker Desktop's **Contain
 
 ## Backup and restore
 
-Stop Purevault before taking a backup. Back up its data and key volumes together, label them as one set, and store them securely. The data volume contains the SQLite database; the separate key volume contains the encryption key required to decrypt vault entries.
+Replacing the container preserves the vault when its intact data and key volumes are reattached. For a host-level backup, stop Purevault and copy both volumes. Label them as a matched set and store them securely. The data volume contains the SQLite database. The key volume contains the encryption key required to decrypt vault entries.
 
 The standard Compose project creates `purevault_purevault_data` and `purevault_purevault_keys`. The standalone Docker Run example creates `purevault_data` and `purevault_keys`. Confirm which deployment you are backing up with `docker volume ls`; never mix a data volume from one installation with a key volume from another.
 
-Key loss is unrecoverable. Never restore a database with a different key. Keeping copies of the database and key backup separate where practical reduces accidental exposure.
+If either volume is lost, recovery requires a copy of the missing database or its matching key. Keep their copies separate where practical. Anyone who has both can access the passwords outside Purevault's unlock delays.
 
-For an off-host copy that can restore into an empty installation without the original encryption key, use [portable encrypted backups](BACKUPS.md). Keep both the backup file and its independent recovery passphrase. The paired-volume backup and the portable backup serve different recovery needs: a full volume restore recovers the installation, while portable restore imports entries and settings into a new vault with every entry locked.
+Purevault no longer generates portable password backups. An encrypted export from an earlier version can still be [restored into an empty vault](BACKUPS.md) with its original recovery passphrase.
 
 ## Updating safely
 
@@ -124,7 +126,7 @@ Do not change the Compose project or volume names during an update. Never use `d
 
 1. Stop Purevault and back up the data and key volumes together. Use `docker compose stop` or `docker compose -f compose.image.yaml stop`, matching the files used to start it.
 2. Install the new files. Keep the same project name and named volumes. Move any HTTPS settings you still need from the old `.env` into `.env.https` and use the HTTPS override below. For a custom local host port, edit the mapping directly, for example `"127.0.0.1:8127:8080"`. The old `PUREVAULT_PORT` and `PUREVAULT_BIND_ADDRESS` variables are retired from Compose.
-3. Rebuild and start with `docker compose up --build -d`, or use the prebuilt quick start once the matching image is available. Verify `docker compose ps` shows the expected loopback port and confirm your vault data is present. Update any proxy upstream from the old port to `8080`.
+3. Rebuild and start with `docker compose up --build -d`, or use the prebuilt quick start. Verify `docker compose ps` shows the expected loopback port and confirm your vault data is present. Update any proxy upstream from the old port to `8080`.
 
 For a standalone Docker Run upgrade, stop and remove the old **container** after backing up both volumes. Recreate it with the new port mapping and the same two volume names.
 

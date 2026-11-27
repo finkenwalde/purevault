@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { BackupsPanel } from "./BackupsPanel";
+import { RestoreBackupPanel } from "./RestoreBackupPanel";
 import {
   MEANINGFUL_ACTIVITY_EVENTS,
   advanceSessionGeneration,
@@ -73,7 +73,7 @@ function cookie(name: string) {
   );
 }
 
-async function api<T>(path: string, options: RequestInit = {}, read?: (response: Response) => Promise<T>): Promise<T> {
+async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const requestGeneration = captureSessionGeneration();
   const response = await fetch(`/api${path}`, {
     ...options,
@@ -87,12 +87,6 @@ async function api<T>(path: string, options: RequestInit = {}, read?: (response:
   });
   if (!responseBelongsToCurrentSession(requestGeneration))
     throw new Error("The session ended before this response completed.");
-  if (read && response.ok) {
-    const result = await read(response);
-    if (!responseBelongsToCurrentSession(requestGeneration))
-      throw new Error("The session ended before this response completed.");
-    return result;
-  }
   const data = await response
     .json()
     .catch(() => ({ error: "The server returned an unreadable response." }));
@@ -213,6 +207,23 @@ const emptyForm = {
   relock_unit: "minutes",
 };
 
+const durationUnitDays: Record<string, number> = {
+  seconds: 86400,
+  minutes: 1440,
+  hours: 24,
+  days: 1,
+};
+
+function validDuration(amount: string, unit: string, maxDays: number) {
+  const value = Number(amount);
+  return /^[0-9]+$/.test(amount) && value >= 1 && value <= maxDays * durationUnitDays[unit];
+}
+
+function selectedDuration(amount: string, unit: string) {
+  const value = Number(amount);
+  return `${value} ${value === 1 ? unit.slice(0, -1) : unit}`;
+}
+
 function EntryForm({
   onCreated,
   editing,
@@ -241,6 +252,7 @@ function EntryForm({
   const [busy, setBusy] = useState(false);
   const [currentSecret, setCurrentSecret] = useState<string | null>(null);
   const [showCurrent, setShowCurrent] = useState(false);
+  const confirmation = useRef<HTMLDialogElement>(null);
   const revealRequest = useRef(0);
   const set = (key: string, value: string) =>
     setForm((current) => ({ ...current, [key]: value }));
@@ -276,10 +288,26 @@ function EntryForm({
       if (request === revealRequest.current) setBusy(false);
     }
   }
-  async function submit(event: FormEvent) {
+  function submit(event: FormEvent) {
     event.preventDefault();
+    if (busy || confirmation.current?.open) return;
+    setError("");
+    if (!editing) {
+      if (!form.title.trim()) {
+        setError("Enter an entry title.");
+      } else if (!validDuration(form.unlock_delay, form.unlock_unit, 365)) {
+        setError("Enter an unlock delay as a whole number between 1 second and 365 days.");
+      } else if (form.relock_policy === "automatic" && !validDuration(form.relock_after, form.relock_unit, 30)) {
+        setError("Enter an access window as a whole number between 1 second and 30 days.");
+      } else {
+        confirmation.current?.showModal();
+      }
+      return;
+    }
     const submitter = (event.nativeEvent as SubmitEvent).submitter as HTMLButtonElement | null;
-    const relock = editing && submitter?.value === "relock";
+    void save(submitter?.value === "relock");
+  }
+  async function save(relock: boolean) {
     setBusy(true);
     setError("");
     try {
@@ -454,6 +482,25 @@ function EntryForm({
           {busy ? "Saving…" : editing ? "Save changes and relock" : "Create locked entry"}
         </button>
       </div>
+      {!editing && (
+        <dialog ref={confirmation} className="entry-confirmation" aria-labelledby="entry-confirmation-title" aria-describedby="entry-confirmation-summary">
+          <h2 id="entry-confirmation-title">Create this locked entry?</h2>
+          <p id="entry-confirmation-summary">
+            Unlock delay of <strong>{selectedDuration(form.unlock_delay, form.unlock_unit)}</strong>.
+            {" "}{form.relock_policy === "automatic" ? (
+              <>Automatic relock after a <strong>{selectedDuration(form.relock_after, form.relock_unit)}</strong> access window.</>
+            ) : "Manual relock. The password stays available until you choose Lock now."}
+          </p>
+          <div className="form-actions">
+            <button type="button" className="button ghost" onClick={() => confirmation.current?.close()}>Cancel</button>
+            <button type="button" className="button primary" onClick={() => {
+              if (!confirmation.current?.open) return;
+              confirmation.current.close();
+              void save(false);
+            }}>Create entry</button>
+          </div>
+        </dialog>
+      )}
     </form>
   );
 }
@@ -617,7 +664,7 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
 
 const settingsTabs = [
   { id: "display-time", label: "Display time" },
-  { id: "backups", label: "Backups" },
+  { id: "backups", label: "Restore backup" },
   { id: "security", label: "Security" },
 ] as const;
 const settingsHashes = new Set([
@@ -930,12 +977,7 @@ function SettingsPanel({
         </form>
       </div>
       <div className="settings-section" id="backups" role="tabpanel" aria-labelledby="tab-backups" hidden={tab !== 1}>
-        <BackupsPanel
-          active={tab === 1}
-          api={api}
-          formatDate={(date) => localTime(date, session.display_timezone)}
-          onRestore={onRestore}
-        />
+        {tab === 1 && <RestoreBackupPanel api={api} onRestore={onRestore} />}
       </div>
       <div className="settings-section" id="security" role="tabpanel" aria-labelledby="tab-security" hidden={tab !== 2}>
         {tab === 2 && <SecurityPanel username={session.username} />}
@@ -1212,7 +1254,6 @@ function App() {
             <h1>Make access intentional.</h1>
             <p>
               Passwords stay locked until their full waiting period has passed.
-              Waiting pauses while Purevault is stopped.
             </p>
           </div>
           <button

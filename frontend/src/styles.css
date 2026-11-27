@@ -294,6 +294,23 @@ fieldset legend {
   justify-content: flex-end;
   gap: 10px;
 }
+.entry-confirmation {
+  width: min(440px, calc(100% - 32px));
+  padding: 24px;
+  background: var(--paper);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+}
+.entry-confirmation::backdrop {
+  background: rgb(25 35 30 / 55%);
+}
+.entry-confirmation h2 {
+  margin: 0;
+}
+.entry-confirmation p {
+  line-height: 1.5;
+}
 .entry-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -625,48 +642,10 @@ footer {
   background: #edf4ef;
   border-color: #bfd1c6;
 }
-.backup-sections {
-  display: grid;
-  gap: 18px;
-}
-.backup-sections section {
-  border-top: 1px solid var(--line);
-  padding-top: 16px;
-}
-.backup-sections p {
-  color: var(--muted);
-  font-size: 14px;
-}
-.backup-sections p.error {
-  color: var(--red);
-}
 .backup-form {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
-}
-.backup-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.backup-files {
-  padding: 0;
-  list-style: none;
-}
-.backup-files li {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  border-bottom: 1px solid var(--line);
-  padding: 9px 0;
-  overflow-wrap: anywhere;
-}
-.backup-files small {
-  display: block;
-  color: var(--muted);
 }
 .timezone-form {
   display: grid;

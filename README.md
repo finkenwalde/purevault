@@ -4,9 +4,11 @@ Purevault is a self-hosted delayed-access password vault. It inserts a server-en
 
 Purevault is a heavily AI-assisted coding project. The author works in IT and has basic programming knowledge.
 
+> **Use at your own risk.** Restarting or replacing the container preserves the vault as long as its original data and key volumes stay intact and are reattached. If you lose the vault database or its matching encryption key without a recovery copy, the saved passwords are unrecoverable. Keep a safe way to recover any critical credentials. See [Docker volume recovery](docs/DEPLOYMENT.md#backup-and-restore).
+
 ## Run with Docker
 
-Once the first public image is available, save [`compose.image.yaml`](compose.image.yaml) and run this command in the same folder:
+Save [`compose.image.yaml`](compose.image.yaml) and run this command in the same folder:
 
 ```sh
 docker compose -f compose.image.yaml up -d --pull always
@@ -16,7 +18,28 @@ The image is `ghcr.io/finkenwalde/purevault:latest` for Intel and AMD 64-bit hos
 
 - For a web interface, see [Deploy with Portainer](docs/DEPLOYMENT.md#deploy-with-portainer).
 - To see what each Compose setting does, see [Compose settings](docs/DEPLOYMENT.md#compose-settings).
-- Until the public image is available, use the source-build quick start below. See the [publishing guide](docs/PUBLISHING.md) for the first release.
+- For a build from source, follow the quick start below.
+
+## Environment variables
+
+All settings below are optional with the Docker image. Both Compose files show the most common settings as commented examples. To use one, uncomment `environment:` and the setting you want. For an HTTPS proxy, follow the [remote deployment guide](docs/DEPLOYMENT.md#remote-and-https-deployment).
+
+| Variable | Docker default | What it does |
+| --- | --- | --- |
+| `PUREVAULT_ALLOWED_HOSTS` | `localhost,127.0.0.1` | Comma-separated IP addresses or hostnames people use to open Purevault. If opening `http://192.168.1.50:31417`, add `192.168.1.50` to the list. A host outside the list can cause **400 Bad Request**. |
+| `PUREVAULT_DISPLAY_TIMEZONE` | `UTC` | Default display timezone, given as an IANA name such as `Europe/Paris`. A timezone chosen under **Settings** takes precedence. |
+| `PUREVAULT_SECURE_COOKIES` | `false` | Set to `true` for HTTPS so sign-in and CSRF cookies are sent only over HTTPS. |
+| `PUREVAULT_TRUST_PROXY_HEADERS` | `false` | Lets a trusted HTTPS reverse proxy tell Purevault whether the request arrived over HTTPS. Enable only if the proxy strips incoming `X-Forwarded-Proto` headers and sets the correct value itself. |
+| `PUREVAULT_SECURE_SSL_REDIRECT` | `false` | Redirects HTTP requests to HTTPS, except for the container health check. Enable after HTTPS works if the proxy doesn't already redirect HTTP. |
+| `PUREVAULT_CSRF_TRUSTED_ORIGINS` | Empty | Comma-separated additional origins allowed to submit forms. Include the scheme and port if applicable, for example `https://vault.example.com:8443`. A normal same-origin setup can leave this empty. |
+| `PUREVAULT_HSTS_SECONDS` | `0` | Tells browsers to use HTTPS for this hostname and its subdomains for the given number of seconds. Enable only after HTTPS is working. |
+| `PUREVAULT_LOGIN_ATTEMPTS` | `8` | Number of failed sign-in attempts allowed per browser session within the window below. |
+| `PUREVAULT_LOGIN_WINDOW_SECONDS` | `300` | How far back, in seconds, Purevault counts failed attempts for the sign-in limit. |
+| `PUREVAULT_DJANGO_SECRET_KEY` | Generated and stored at `/data/django-secret` | Optional override for Django's signing secret. Changing it can invalidate existing sessions. |
+| `PUREVAULT_DATA_DIR` | `/data` | Directory for the SQLite database. Leave it at the default when using the supplied volume mapping. |
+| `PUREVAULT_KEY_FILE` | `/keys/app.key` | File containing the vault's encryption key. Keep this path on persistent storage. Existing vault entries require their original key. |
+
+The image also sets internal variables. `PUREVAULT_CLOCK_GENERATION` identifies the current runtime for unlock delays. `DJANGO_SETTINGS_MODULE` selects Purevault's Django settings. `PYTHONDONTWRITEBYTECODE` prevents Python from writing bytecode cache files, and `PYTHONUNBUFFERED` sends output to Docker logs immediately.
 
 ## Quick start on your computer
 
@@ -84,19 +107,18 @@ The backend uses **Django**, a Python web framework, for sign-in, data storage, 
 - **Sign-in and sessions.** Django hashes the master password, manages session cookies, and protects requests that change vault data with CSRF checks. Sessions expire after 10 minutes of inactivity.
 - **Vault encryption.** Saved passwords are encrypted with Fernet. The database and its encryption key are kept in separate Docker volumes.
 - **Unlock delays.** The server checks each request to reveal a password. It measures elapsed time while Purevault is running, so changing the browser clock cannot shorten the wait.
-- **Portable backups.** Backup files are encrypted and protected by a separate recovery passphrase. Restored entries start locked and require their full delay.
 
-Anyone who controls the Docker host can bypass the app's controls. Anyone with both a backup file and its recovery passphrase can also decrypt it outside Purevault. For details, see the [architecture and security boundary](docs/ARCHITECTURE.md).
+Anyone who controls the Docker host can bypass the app's controls. For details, see the [architecture and security boundary](docs/ARCHITECTURE.md).
 
 ## Other installation and maintenance options
 
-Use [portable encrypted backups](docs/BACKUPS.md) to download an off-host recovery copy or restore into an empty installation.
+Purevault no longer creates portable password backups. If you already have one, see [Restore a legacy backup](docs/BACKUPS.md).
 
 See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 
 - the complete `docker run` option;
 - Git clone and update instructions;
-- backup and restore guidance;
+- Docker volume backup and restore guidance;
 - configuration and remote HTTPS considerations;
 - development and test commands.
 

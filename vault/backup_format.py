@@ -1,7 +1,6 @@
-"""Version 1 portable backup format. See docs/BACKUPS.md."""
+"""Reader for the legacy version 1 portable backup format."""
 
 import json
-import os
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from cryptography.exceptions import InvalidTag
@@ -40,30 +39,9 @@ def _wrapping_key(passphrase, salt):
     return Scrypt(salt=salt, length=32, n=2**16, r=8, p=1).derive(_passphrase_bytes(passphrase))
 
 
-def create_recovery_bundle(passphrase):
-    private = X25519PrivateKey.generate()
-    salt, nonce = os.urandom(16), os.urandom(12)
-    encrypted = AESGCM(_wrapping_key(passphrase, salt)).encrypt(
-        nonce, private.private_bytes_raw(), WRAP_DOMAIN + salt,
-    )
-    return private.public_key().public_bytes_raw(), salt + nonce + encrypted
-
-
 def _file_key(private, peer):
     shared = private.exchange(X25519PublicKey.from_public_bytes(peer))
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=FILE_DOMAIN).derive(shared)
-
-
-def pack_backup(payload, public_key, recovery_bundle):
-    if len(payload["entries"]) > MAX_ENTRIES:
-        raise InvalidBackup
-    plaintext = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    if len(plaintext) + HEADER_BYTES + 16 > MAX_FILE_BYTES:
-        raise InvalidBackup
-    ephemeral = X25519PrivateKey.generate()
-    nonce = os.urandom(12)
-    header = MAGIC + recovery_bundle + ephemeral.public_key().public_bytes_raw() + nonce
-    return header + AESGCM(_file_key(ephemeral, public_key)).encrypt(nonce, plaintext, header)
 
 
 def _validated_payload(payload):

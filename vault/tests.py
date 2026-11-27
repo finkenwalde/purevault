@@ -1,7 +1,7 @@
+import base64
 import json
 import os
 import tempfile
-from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
@@ -11,15 +11,15 @@ from cryptography.fernet import Fernet
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.db import close_old_connections
+from django.core.management import get_commands
+from django.db import close_old_connections, connection
+from django.db.migrations.executor import MigrationExecutor
 from django.db.models.query import QuerySet
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from vault import backups
-from vault.backup_format import InvalidBackup, create_recovery_bundle
 from vault.crypto import encrypt_secret
-from vault.models import BackupSettings, InstallationState, RuntimeClock, UnlockGrant, UserProfile, VaultEntry
+from vault.models import InstallationState, RuntimeClock, UnlockGrant, UserProfile, VaultEntry
 from vault.session_activity import SESSION_ACTIVITY_GENERATION_KEY, SESSION_ACTIVITY_RUNTIME_KEY
 from vault.services import (
     ClockUnavailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock,
@@ -530,7 +530,7 @@ class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
         self.user.refresh_from_db()
         self.assertEqual(self.user.password, original)
 
-    def test_change_preserves_current_session_grants_encryption_and_backups(self):
+    def test_change_preserves_current_session_grants_and_encryption(self):
         directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
         key_file = directory / "vault.key"
         self.enterContext(override_settings(PUREVAULT_KEY_FILE=key_file))
@@ -540,10 +540,8 @@ class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
         )
         with self.mono(0):
             start_unlock(entry)
-        BackupSettings.objects.create(owner=self.user, public_key=b"test public", recovery_bundle=b"test wrapped")
         original_entry = VaultEntry.objects.values().get(pk=entry.pk)
         original_grant = UnlockGrant.objects.values().get(entry=entry)
-        original_backup = BackupSettings.objects.values().get(owner=self.user)
         original_key = key_file.read_bytes()
         other = Client()
         force_login_active(other, self.user)
@@ -563,7 +561,6 @@ class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
                 self.assertEqual(response.status_code, code)
         self.assertEqual(VaultEntry.objects.values().get(pk=entry.pk), original_entry)
         self.assertEqual(UnlockGrant.objects.values().get(entry=entry), original_grant)
-        self.assertEqual(BackupSettings.objects.values().get(owner=self.user), original_backup)
         self.assertEqual(key_file.read_bytes(), original_key)
 
     def test_stale_request_cannot_overwrite_concurrent_change(self):
@@ -582,9 +579,21 @@ class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
         self.assertEqual(self.change().status_code, 200)
 
 
-class BackupTests(RuntimeClockMixin, TestCase):
-    phrase = "sundial forest mint compass velvet"
+class LegacyRestoreTests(RuntimeClockMixin, TestCase):
+    phrase = "synthetic legacy recovery phrase"
     master = "neutral master sample phrase"
+    # Produced by Purevault's original v1 writer with synthetic data.
+    fixture = base64.b64decode(
+        "UFZCQUNLMDFQ75aGKi4ysJBZLmWvUNXSt8u2/AHlqtLRLTKMF/jK8iuOeu4+yoaDwtz"
+        "2Dp15bB/qTCWr4+95dWfx5ITTw0/DZEXtEsdXTHowYHPoAJuq+WuBcIf3xsvdjSuUEXS"
+        "nHCVNt/uIZD3IjXYrrhy8Y+0nll59dZunr2QvK5JZCcK325SpXbw1vU0im6PlHPaU+OF"
+        "PlVMnRakh3Rb9DiIO6ZDU4Y1zYyCtds2pJzRLd0DQ2VshUhUVZLlZviUIwzSQOXukF34"
+        "mhorD4ClE6hQz423cgqi425GLl1la2ub2L0BTI+aaKmqhA4UeiCJpLRPx5Ac1Ri8hrpY"
+        "vvEG2kLJHgbec3rytLV1iuhMwKrdHMXgT16vID7tu+pb020wEjxFiz+li9+FslNxT0/+"
+        "/vy2wc52ZbsUhaKaAbPJVebQbsBF/h7yrLgnKnfxErgZvMR6CQN5fAdJ1ugBI2DHFWpF"
+        "/JmwylkjrDlh7dojgEb+tqeye8ItacAXlYVW3IXX6RPmvfaKjiI24vDBkfYIl6Xo02hD"
+        "2pyYrKNxMex5YP6xDOIqMJR1+418r0goyKG/t2xG26fiEVw9rHw=="
+    )
 
     def setUp(self):
         self.initialize_test_clock()
@@ -601,9 +610,6 @@ class BackupTests(RuntimeClockMixin, TestCase):
         )
         UserProfile.objects.create(user=self.user, display_timezone="Asia/Tokyo")
 
-    def configure(self):
-        return backups.configure(self.user.pk, 1, 1, create_recovery_bundle(self.phrase))
-
     def submit_restore(self, client, data, phrase=None, master=None):
         with self.mono(0):
             return client.post("/api/backups/restore/", {
@@ -612,42 +618,8 @@ class BackupTests(RuntimeClockMixin, TestCase):
                 "current_password": master or self.master,
             })
 
-    def test_schedule_retains_previous_file_after_failed_durable_publish(self):
-        self.configure()
-        self.assertTrue(backups.run_backup(self.user.pk))
-        old, = backups.backup_files(self.user.pk)
-        due = timezone.now() - timedelta(days=8)
-        BackupSettings.objects.filter(owner=self.user).update(next_run_at=due)
-        with patch("vault.backup_format._wrapping_key", side_effect=AssertionError("requires decryption")), \
-             patch("vault.backups._sync_directory", side_effect=OSError("synthetic failure")):
-            with self.assertRaises(InvalidBackup):
-                backups.run_backup(self.user.pk, scheduled=True)
-        self.assertEqual(backups.backup_files(self.user.pk), [old])
-        self.assertTrue(BackupSettings.objects.get(owner=self.user).last_error)
-
-        BackupSettings.objects.filter(owner=self.user).update(next_run_at=due)
-        with patch("vault.backup_format._wrapping_key", side_effect=AssertionError("requires decryption")):
-            self.assertTrue(backups.run_backup(self.user.pk, scheduled=True))
-            self.assertFalse(backups.run_backup(self.user.pk, scheduled=True))
-        new, = backups.backup_files(self.user.pk)
-        self.assertNotEqual(new, old)
-        self.assertFalse(old.exists())
-        self.assertGreater(BackupSettings.objects.get(owner=self.user).next_run_at, timezone.now())
-
     def test_portable_restore_is_atomic_and_starts_a_full_locked_wait(self):
-        self.configure()
-        with self.mono(0):
-            start_unlock(self.entry)
-        backups.run_backup(self.user.pk)
-        path, = backups.backup_files(self.user.pk)
-        with self.mono(0):
-            download = self.client.get(f"/api/backups/files/{path.name}/")
-        self.assertEqual(download.status_code, 200)
-        self.assertIn("no-store", download["Cache-Control"])
-        data = b"".join(download.streaming_content)
-        download.close()
-        self.assertNotIn(b"Vault test title", data)
-        self.assertNotIn(b"example secret", data)
+        data = self.fixture
         self.assertEqual(self.submit_restore(self.client, data).status_code, 409)
 
         target = User.objects.create_user("target-example", password=self.master)
@@ -660,12 +632,14 @@ class BackupTests(RuntimeClockMixin, TestCase):
             self.assertEqual(self.submit_restore(client, data, master="wrong master phrase").status_code, 403)
             self.assertFalse(UserProfile.objects.filter(user=target).exists())
             self.assertFalse(VaultEntry.objects.filter(owner=target).exists())
-            self.assertEqual(self.submit_restore(client, data).json(), {"restored": 1})
-            entry = VaultEntry.objects.get(owner=target)
+            self.assertEqual(self.submit_restore(client, data).json(), {"restored": 2})
+            entry = VaultEntry.objects.get(owner=target, title="Vault test title")
+            manual = VaultEntry.objects.get(owner=target, title="Manual test title")
             self.assertNotEqual(entry.encrypted_secret, self.entry.encrypted_secret)
             self.assertEqual((entry.unlock_delay_seconds, entry.relock_after_seconds), (30, 60))
+            self.assertEqual((manual.unlock_delay_seconds, manual.relock_policy, manual.relock_after_seconds), (120, "manual", None))
             self.assertEqual(UserProfile.objects.get(user=target).display_timezone, "Asia/Tokyo")
-            self.assertFalse(BackupSettings.objects.filter(owner=target).exists())
+            self.assertFalse(UnlockGrant.objects.filter(entry__owner=target).exists())
             with self.mono(0):
                 self.assertEqual(grant_status(entry)[0], "locked")
                 self.assertEqual(start_unlock(entry)[1].eligible_runtime_ms, 30000)
@@ -676,16 +650,50 @@ class BackupTests(RuntimeClockMixin, TestCase):
             with self.mono(30):
                 self.assertEqual(release_secret(entry), ("example secret", "available"))
 
-    def test_backup_endpoints_require_auth_csrf_and_master_for_recovery_setup(self):
-        data = {"passphrase": self.phrase, "confirmation": self.phrase, "interval_days": 0, "retention": 7}
+    def test_restore_requires_auth_csrf_and_bounds_uploads(self):
         csrf = Client(enforce_csrf_checks=True)
         force_login_active(csrf, self.user)
+        self.assertEqual(self.submit_restore(Client(), self.fixture).status_code, 401)
+        self.assertEqual(self.submit_restore(csrf, self.fixture).status_code, 403)
+        oversized = csrf.generic("POST", "/api/backups/restore/", b"x", CONTENT_LENGTH=str(20 * 1024 * 1024))
+        self.assertEqual(oversized.status_code, 413)
+
+    def test_retired_export_routes_cannot_serve_existing_files_or_shell(self):
+        name = "20261001T010203000001Z-0123456789abcdef0123456789abcdef.pvbackup"
+        existing = self.root / "backups" / str(self.user.pk) / name
+        existing.parent.mkdir(parents=True)
+        existing.write_bytes(self.fixture)
         with self.mono(0):
-            self.assertEqual(Client().get("/api/backups/").status_code, 401)
-            self.assertEqual(csrf.put("/api/backups/", data, content_type="application/json").status_code, 403)
-            self.assertEqual(self.client.put("/api/backups/", data, content_type="application/json").status_code, 403)
-            self.assertEqual(self.client.put("/api/backups/", {**data, "current_password": self.master}, content_type="application/json").status_code, 200)
-            self.assertEqual(csrf.post("/api/backups/run/", "{}", content_type="application/json").status_code, 403)
-            self.assertEqual(self.submit_restore(csrf, b"example").status_code, 403)
-            oversized = csrf.generic("POST", "/api/backups/restore/", b"x", CONTENT_LENGTH=str(20 * 1024 * 1024))
-            self.assertEqual(oversized.status_code, 413)
+            for path in ("/api/backups", "/api/backups/", "/api/backups/run/", f"/api/backups/files/{name}/"):
+                for method in ("GET", "HEAD", "POST", "PUT"):
+                    with self.subTest(path=path, method=method):
+                        self.assertEqual(self.client.generic(method, path).status_code, 404)
+            self.assertEqual(self.client.get(f"/api/backups/files/{name}/", SCRIPT_NAME="/purevault").status_code, 404)
+        self.assertEqual(existing.read_bytes(), self.fixture)
+        self.assertNotIn("run_backup_scheduler", get_commands())
+
+
+class RestoreOnlyMigrationTests(TransactionTestCase):
+    def test_upgrade_preserves_existing_backup_settings_and_vault_data(self):
+        before = [("vault", "0007_backupsettings")]
+        after = [("vault", "0008_retire_backup_settings")]
+        historical_apps = MigrationExecutor(connection).migrate(before).apps
+        settings_model = historical_apps.get_model("vault", "BackupSettings")
+        try:
+            owner = User.objects.create_user("upgrade-example")
+            entry = VaultEntry.objects.create(owner=owner, title="Existing entry", encrypted_secret=b"synthetic encrypted data",
+                                             unlock_delay_seconds=60, relock_policy="manual")
+            old_settings = settings_model.objects.create(
+                owner_id=owner.pk, public_key=b"synthetic public key", recovery_bundle=b"synthetic wrapped key",
+                interval_days=1, next_run_at=timezone.now(),
+            )
+            snapshot = settings_model.objects.values().get(pk=old_settings.pk)
+            upgraded_apps = MigrationExecutor(connection).migrate(after).apps
+            with self.assertRaises(LookupError):
+                upgraded_apps.get_model("vault", "BackupSettings")
+            self.assertEqual(settings_model.objects.values().get(pk=old_settings.pk), snapshot)
+            self.assertEqual(VaultEntry.objects.get(pk=entry.pk).encrypted_secret, b"synthetic encrypted data")
+        finally:
+            # The retired table is outside the app registry and the test runner's flush.
+            settings_model.objects.all().delete()
+            MigrationExecutor(connection).migrate(after)

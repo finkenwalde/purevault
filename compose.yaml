@@ -6,6 +6,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8080:8080"
+    # Uncomment the environment block and the settings you want to change.
+    # environment:
+    #   PUREVAULT_ALLOWED_HOSTS: "localhost,127.0.0.1,vault.example.com" #optional
+    #   PUREVAULT_DISPLAY_TIMEZONE: "Etc/UTC" #optional
     volumes:
       - purevault_data:/data
       - purevault_keys:/keys

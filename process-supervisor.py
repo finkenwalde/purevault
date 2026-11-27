@@ -21,9 +21,8 @@ signal.signal(signal.SIGTERM, stop_children)
 signal.signal(signal.SIGINT, stop_children)
 
 timekeeper = subprocess.Popen([sys.executable, "manage.py", "run_timekeeper"], env=os.environ.copy())
-scheduler = subprocess.Popen([sys.executable, "manage.py", "run_backup_scheduler"], env=os.environ.copy())
 server = subprocess.Popen(sys.argv[1:], env=os.environ.copy())
-children.extend([timekeeper, scheduler, server])
+children.extend([timekeeper, server])
 
 exit_code = 0
 try:

@@ -61,16 +61,3 @@ class UnlockGrant(models.Model):
     release_count = models.PositiveIntegerField(default=0)
     last_released_at = models.DateTimeField(null=True, blank=True)
 
-
-class BackupSettings(models.Model):
-    owner = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
-    public_key = models.BinaryField()
-    recovery_bundle = models.BinaryField()
-    interval_days = models.PositiveSmallIntegerField(default=0)
-    retention = models.PositiveSmallIntegerField(default=7)
-    next_run_at = models.DateTimeField(null=True, blank=True)
-    last_success_at = models.DateTimeField(null=True, blank=True)
-    last_error = models.CharField(max_length=160, blank=True, default="")
-    run_token = models.UUIDField(null=True, blank=True)
-    lease_until = models.DateTimeField(null=True, blank=True)
-

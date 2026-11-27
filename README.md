@@ -4,9 +4,23 @@ Purevault is a self-hosted delayed-access password vault. It inserts a server-en
 
 Purevault is a heavily AI-assisted coding project. The author works in IT and has basic programming knowledge.
 
+## Run with Docker
+
+Once the first public image is available, save [`compose.image.yaml`](compose.image.yaml) and run this command in the same folder:
+
+```sh
+docker compose -f compose.image.yaml up -d --pull always
+```
+
+The image is `ghcr.io/finkenwalde/purevault:latest` for Intel and AMD 64-bit hosts. Open [http://127.0.0.1:8080](http://127.0.0.1:8080) on the computer running Docker to create your account. The default setup needs no environment variables.
+
+- For a web interface, see [Deploy with Portainer](docs/DEPLOYMENT.md#deploy-with-portainer).
+- To see what each Compose setting does, see [Compose settings](docs/DEPLOYMENT.md#compose-settings).
+- Until the public image is available, use the source-build quick start below. See the [publishing guide](docs/PUBLISHING.md) for the first release.
+
 ## Quick start on your computer
 
-This quick start runs Purevault only on the same computer as Docker. It is not a guide for public or remote hosting.
+This quick start builds Purevault from source and keeps browser access on the computer running Docker.
 
 ### 1. Install and start Docker Desktop
 
@@ -87,7 +101,5 @@ See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 - development and test commands.
 
 See the [sequential feature roadmap](docs/ROADMAP.md) for approved work that will be implemented and reviewed one feature at a time.
-
-Use the source-build quick start above until a public 8080-compatible image is verified. After that, the [prebuilt image quick start](docs/DEPLOYMENT.md#prebuilt-image-quick-start) is the shortest installation path. Maintainers can publish it using the [container image publication guide](docs/PUBLISHING.md).
 
 Purevault is available under the [MIT License](LICENSE).

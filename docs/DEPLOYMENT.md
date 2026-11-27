@@ -1,18 +1,39 @@
 # Purevault deployment and maintenance
 
-The recommended first installation is the [Docker Compose quick start](../README.md#quick-start-on-your-computer). It builds the application from the downloaded source, binds it to `127.0.0.1`, and stores the database and encryption key in persistent Docker volumes.
-
-Use the source-build quick start until the new port-8080 GHCR build is public and anonymously pullable.
+Use the [source-build quick start](../README.md#quick-start-on-your-computer) until the first public image is available. Both installation methods keep access local by default and store the vault and encryption key in Docker volumes.
 
 ## Prebuilt image quick start
 
-Once the new port-8080 `linux/amd64` image is public and verified, open a terminal in the extracted source folder and run:
+Once the public image is available, save [`compose.image.yaml`](../compose.image.yaml). Open a terminal in the folder where you saved it and run:
 
 ```powershell
 docker compose -f compose.image.yaml up -d --pull always
 ```
 
-Open [http://127.0.0.1:8080](http://127.0.0.1:8080). Existing installations should follow the [port upgrade steps](#upgrading-to-port-8080) first. An image built with the old internal port 8000 needs its matching Compose file or a published mapping targeting 8000. See the [publication guide](PUBLISHING.md) to publish and verify the new build.
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080) on the Docker host. If your existing installation uses container port 8000, follow the [port upgrade steps](#upgrading-to-port-8080) first.
+
+### Deploy with Portainer
+
+Once the image is public, use a Docker Standalone environment in Portainer.
+
+1. Open **Stacks → Add stack** and enter `purevault` as the stack name.
+2. Select **Web editor** and paste the contents of [`compose.image.yaml`](../compose.image.yaml).
+3. Click **Deploy the stack**.
+4. Open [http://127.0.0.1:8080](http://127.0.0.1:8080) on the Docker host and create your account. For a separate Docker server, use the [SSH tunnel instructions](#remote-and-https-deployment) to open first-run setup from your computer.
+
+See the [Portainer stack guide](https://docs.portainer.io/user/docker/stacks/add#option-1-web-editor).
+
+### Compose settings
+
+| Setting | What it does |
+| --- | --- |
+| `image` | Pulls Purevault from GitHub Container Registry. The published image targets `linux/amd64` (64-bit Intel and AMD). Docker can select it on a matching host without a `platform` setting. |
+| `ports` | Keeps setup and sign-in reachable only from the Docker host by default. A bare `8080:8080` opens the port on every host interface. |
+| `purevault_data:/data` | Stores the vault database, settings, and locally saved backups. |
+| `purevault_keys:/keys` | Stores the encryption key needed to read saved passwords. Keep this volume with the matching data volume when moving or backing up an installation. |
+| `restart` | Starts Purevault again after Docker restarts unless you stopped Purevault yourself. |
+| `security_opt` | Prevents a program inside Purevault's container from gaining extra privileges when it starts another program. |
+| `cap_drop` | Removes extra Linux privileges Purevault does not need. |
 
 ## Git checkout alternative
 

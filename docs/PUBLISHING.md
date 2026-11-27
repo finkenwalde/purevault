@@ -20,12 +20,9 @@ Official references:
 
 1. Review all current repository changes. Make sure no `.env` file, database, encryption key, backup, real password, personal story, or local-only file is included.
 2. Commit the reviewed project files and push that commit to the repository's `main` branch. The workflow can publish only files that are committed and present on GitHub; it cannot see uncommitted files on your computer.
-3. Open [the Purevault repository](https://github.com/finkenwalde/purevault) on GitHub.
-4. Select the **Actions** tab.
-5. In the workflow list, select **Publish container image**.
-6. Select **Run workflow**.
-7. Confirm **Branch: main** and enter `0.1.0` for the first release. Select **Run workflow** only when you are ready to publish. The field accepts numeric `0.MINOR.PATCH` versions without a `v` prefix, leading zeros, or prerelease suffixes.
-8. Open the new workflow run and wait for both **Verify clean source** and **Publish linux/amd64 image** to finish successfully.
+3. Open the [Publish container image workflow](https://github.com/finkenwalde/purevault/actions/workflows/publish-image.yml) and select **Run workflow**.
+4. Choose `main` as the branch and enter `0.1.0` for the first release. Click **Run workflow** again. Use a numeric `0.MINOR.PATCH` version.
+5. Open the new run and wait for both **Verify clean source** and **Publish linux/amd64 image** to turn green.
 
 The workflow uses GitHub's short-lived `GITHUB_TOKEN`. The publication job receives `packages: write` and tests the exact image before logging in or pushing. For version `0.1.0`, it publishes these tags:
 
@@ -81,6 +78,8 @@ docker compose -f compose.image.yaml up -d --pull always
 Always include `-f compose.image.yaml` for image-based commands. Running plain `docker compose up` uses the source-build file instead. Do not combine the two files in one command.
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080) when the service is healthy. For a remote HTTPS proxy, add the [optional HTTPS override](DEPLOYMENT.md#remote-and-https-deployment).
+
+For a Docker Standalone stack, see [Deploy with Portainer](DEPLOYMENT.md#deploy-with-portainer).
 
 Because both files declare `name: purevault` and the same volume keys, running either file from this repository reuses `purevault_purevault_data` and `purevault_purevault_keys`. Confirm those volume names with `docker volume ls` before changing installation methods. Never use `docker compose down --volumes` during an update.
 

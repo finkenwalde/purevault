@@ -1,9 +1,7 @@
 name: purevault
 services:
   web:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    build: .
     image: purevault:local
     restart: unless-stopped
     ports:
@@ -11,10 +9,8 @@ services:
     volumes:
       - purevault_data:/data
       - purevault_keys:/keys
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
 
 volumes:
   purevault_data:

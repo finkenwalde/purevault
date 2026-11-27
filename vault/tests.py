@@ -89,6 +89,83 @@ class VaultSecurityTests(RuntimeClockMixin, TestCase):
         force_login_active(self.client, self.other)
         self.assertEqual(self.post(f"/api/entries/{self.entry.id}/reveal/").status_code, 404)
 
+    def test_delete_requires_owner_csrf_and_current_master_password(self):
+        path = f"/api/entries/{self.entry.id}/"
+        payload = {"current_password": "long-neutral-test-password"}
+        csrf_client = Client(enforce_csrf_checks=True)
+        other_client = Client()
+        force_login_active(csrf_client, self.user)
+        force_login_active(other_client, self.other)
+        with self.mono(0):
+            self.assertEqual(Client().delete(path, payload, content_type="application/json").status_code, 401)
+            self.assertEqual(csrf_client.delete(path, payload, content_type="application/json").status_code, 403)
+            other_payload = {"current_password": "another-neutral-test-password"}
+            self.assertEqual(other_client.delete(path, other_payload, content_type="application/json").status_code, 404)
+            denied = self.client.delete(path, {"current_password": "incorrect password"}, content_type="application/json")
+            self.assertEqual(denied.status_code, 403)
+            self.assertEqual(denied.json(), {"error": "Current master password is incorrect."})
+            for invalid in ({}, {"current_password": 42}, {"current_password": "x" * 4097},
+                            {"current_password": "\ud800"}, {**payload, "unexpected": True}):
+                with self.subTest(invalid=type(invalid.get("current_password")).__name__):
+                    self.assertEqual(self.client.delete(path, invalid, content_type="application/json").status_code, 400)
+            self.assertTrue(VaultEntry.objects.filter(pk=self.entry.pk).exists())
+
+            csrf_client.get("/api/session/")
+            token = csrf_client.cookies["csrftoken"].value
+            response = csrf_client.delete(path, payload, content_type="application/json", HTTP_X_CSRFTOKEN=token)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"ok": True})
+
+    def test_deletes_entry_and_any_grant_in_all_states(self):
+        for state in ("locked", "waiting", "available"):
+            with self.subTest(state=state):
+                entry = VaultEntry.objects.create(
+                    owner=self.user, title="Disposable entry", encrypted_secret=encrypt_secret("synthetic secret"),
+                    unlock_delay_seconds=60, relock_policy="manual",
+                )
+                if state != "locked":
+                    self.set_runtime(0)
+                    with self.mono(0):
+                        start_unlock(entry)
+                runtime = 60 if state == "available" else 0
+                self.set_runtime(runtime)
+                with self.mono(runtime):
+                    self.assertEqual(grant_status(entry)[0], state)
+                    path = f"/api/entries/{entry.id}/"
+                    payload = {"current_password": "long-neutral-test-password"}
+                    response = self.client.delete(path, payload, content_type="application/json")
+                    self.assertEqual(response.json(), {"ok": True})
+                    self.assertEqual(self.client.delete(path, payload, content_type="application/json").status_code, 404)
+                self.assertFalse(VaultEntry.objects.filter(pk=entry.pk).exists())
+                self.assertFalse(UnlockGrant.objects.filter(entry_id=entry.pk).exists())
+                self.assertTrue(VaultEntry.objects.filter(pk=self.entry.pk).exists())
+
+    def test_delete_handles_concurrent_removal(self):
+        def deleted_during_password_check(*_args):
+            VaultEntry.objects.filter(pk=self.entry.pk).delete()
+            return True
+
+        path = f"/api/entries/{self.entry.id}/"
+        with self.mono(0), patch("vault.views.check_password", side_effect=deleted_during_password_check):
+            response = self.client.delete(path, {"current_password": "long-neutral-test-password"}, content_type="application/json")
+        self.assertEqual(response.status_code, 404)
+
+    def test_actions_return_not_found_when_entry_disappears_after_initial_lookup(self):
+        base = f"/api/entries/{self.entry.id}/"
+        edit = {
+            "title": "Example account", "password": "", "unlock_delay": 60,
+            "unlock_unit": "seconds", "relock_policy": "manual",
+        }
+        with self.mono(0):
+            for service, method, path, fields in (
+                ("start_unlock", "POST", base + "unlock/", {}),
+                ("release_secret", "POST", base + "reveal/", {}),
+                ("update_entry_if_available", "PUT", base, edit),
+            ):
+                with self.subTest(service=service), patch(f"vault.views.{service}", side_effect=VaultEntry.DoesNotExist):
+                    result = self.client.generic(method, path, json.dumps(fields), content_type="application/json")
+                    self.assertEqual(result.status_code, 404)
+
     def test_early_reveal_and_metadata_do_not_expose_secret(self):
         self.start(); self.set_runtime(59)
         with self.mono(59):

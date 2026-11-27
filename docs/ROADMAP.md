@@ -22,8 +22,10 @@ Add title search and filters for Locked, Waiting, and Available entries.
 
 Add a cryptographically secure generator for entry creation with configurable length and character categories. Give the user a deliberate opportunity to apply or copy the generated value before saving and locking it. Do not add a plaintext endpoint capable of exposing existing locked entries.
 
-## 6. Recoverable Trash and deletion
+## 6. Recoverable Trash
 
-Add a simple Trash workflow with automatic permanent deletion after 30 days. Moving an entry to Trash cancels its pending grant; trashed entries cannot be unlocked or revealed. Restoring an entry returns it locked and requires a fresh full delay. Permanent deletion requires explicit confirmation and the current master password. Safe purge scheduling and retention details must be finalized during this item.
+Permanent deletion is available from the vault and requires explicit confirmation and the current master password.
+
+A future Trash workflow would hold entries for 30 days before permanent deletion. Moving an entry to Trash would cancel its unlock grant and block reveals. Restoring an entry would return it locked with its full unlock delay.
 
 There is no Archive feature in this roadmap.

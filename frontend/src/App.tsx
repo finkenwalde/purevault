@@ -72,6 +72,15 @@ function cookie(name: string) {
   );
 }
 
+class ApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   const requestGeneration = captureSessionGeneration();
   const response = await fetch(`/api${path}`, {
@@ -93,7 +102,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     endClientSession({ reason: data.code === "inactivity_timeout" ? "inactivity" : "authentication" });
   }
   if (!response.ok)
-    throw new Error(data.error || `Request failed (${response.status})`);
+    throw new ApiError(data.error || `Request failed (${response.status})`, response.status);
   if (!responseBelongsToCurrentSession(requestGeneration))
     throw new Error("The session ended before this response completed.");
   return data;
@@ -501,6 +510,79 @@ function EntryForm({
         </dialog>
       )}
     </form>
+  );
+}
+
+function DeleteEntryDialog({ entry, onCancel, onDeleted }: {
+  entry: Pick<Entry, "id" | "title">;
+  onCancel: () => void;
+  onDeleted: (alreadyGone: boolean) => void;
+}) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const submitting = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!dialog.current?.open) dialog.current?.showModal();
+  }, []);
+
+  function cancel() {
+    if (submitting.current) return;
+    dialog.current?.close();
+    onCancel();
+  }
+
+  async function submit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (submitting.current) return;
+    const form = event.currentTarget;
+    const body = JSON.stringify({ current_password: new FormData(form).get("current_password") });
+    form.reset();
+    submitting.current = true;
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/entries/${entry.id}/`, { method: "DELETE", body });
+    } catch (err) {
+      if (!(err instanceof ApiError && err.status === 404)) {
+        submitting.current = false;
+        setBusy(false);
+        setError((err as Error).message);
+        return;
+      }
+      dialog.current?.close();
+      onDeleted(true);
+      return;
+    }
+    dialog.current?.close();
+    onDeleted(false);
+  }
+
+  return (
+    <dialog
+      ref={dialog}
+      className="entry-confirmation"
+      aria-labelledby="delete-entry-title"
+      aria-describedby="delete-entry-warning"
+      onCancel={(event) => { event.preventDefault(); cancel(); }}
+    >
+      <h2 id="delete-entry-title">Delete this entry?</h2>
+      <p id="delete-entry-warning">
+        This permanently deletes <strong>{entry.title}</strong> and its stored password. This action cannot be undone.
+      </p>
+      <form className="delete-entry-form" onSubmit={submit} aria-busy={busy}>
+        <div className="field">
+          <label htmlFor="delete-entry-password">Current master password</label>
+          <input id="delete-entry-password" name="current_password" type="password" autoComplete="current-password" maxLength={4096} required readOnly={busy} />
+        </div>
+        {error && <p className="error" role="alert">{error}</p>}
+        <div className="form-actions">
+          <button type="button" className="button ghost" disabled={busy} onClick={cancel}>Cancel</button>
+          <button type="submit" className="button danger" disabled={busy}>{busy ? "Deleting…" : "Delete entry"}</button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -994,6 +1076,9 @@ function App() {
       epochMs: Date.now(),
       performanceMs: performance.now(),
     });
+  const [deleteTarget, setDeleteTarget] = useState<Pick<Entry, "id" | "title"> | null>(null);
+  const [deleteNotice, setDeleteNotice] = useState("");
+  const deletedEntryIds = useRef(new Set<number>());
   const syncServerTime = (value: string) =>
     setServerSync({
       epochMs: new Date(value).getTime(),
@@ -1006,6 +1091,9 @@ function App() {
       setRevealed({});
       setShowCreate(false);
       setEditing(null);
+      setDeleteTarget(null);
+      setDeleteNotice("");
+      deletedEntryIds.current.clear();
       setShowSettings(false);
       clearSettingsHash();
       setError("");
@@ -1038,10 +1126,9 @@ function App() {
         "/entries/",
       );
       const sync = performance.now();
-      const synced = value.entries.map((entry) => ({
-        ...entry,
-        sync_performance_ms: sync,
-      }));
+      const synced = value.entries
+        .filter((entry) => !deletedEntryIds.current.has(entry.id))
+        .map((entry) => ({ ...entry, sync_performance_ms: sync }));
       setEntries(synced);
       syncServerTime(value.server_time);
       setRevealed((current) =>
@@ -1067,6 +1154,9 @@ function App() {
       setRevealed({});
       setShowCreate(false);
       setEditing(null);
+      setDeleteTarget(null);
+      setDeleteNotice("");
+      deletedEntryIds.current.clear();
       setShowSettings(false);
       clearSettingsHash();
     }
@@ -1119,6 +1209,7 @@ function App() {
     };
   }, [session?.authenticated]);
   const replace = (entry: Entry) => {
+    if (deletedEntryIds.current.has(entry.id)) return;
     const synced = { ...entry, sync_performance_ms: performance.now() };
     setEntries((current) =>
       current.some((e) => e.id === entry.id)
@@ -1143,6 +1234,7 @@ function App() {
           `/entries/${entry.id}/reveal/`,
           { method: "POST", body: "{}" },
         );
+        if (deletedEntryIds.current.has(entry.id)) return;
         setRevealed((current) => ({ ...current, [entry.id]: result.password }));
       } else {
         const result = await api<{ entry: Entry }>(
@@ -1152,9 +1244,24 @@ function App() {
         replace(result.entry);
       }
     } catch (err) {
+      if (deletedEntryIds.current.has(entry.id)) return;
       setError((err as Error).message);
       loadEntries();
     }
+  }
+  function finishDeletion(entryId: number, alreadyGone: boolean) {
+    // Earlier polls and actions can still return snapshots for this entry.
+    deletedEntryIds.current.add(entryId);
+    setEntries((current) => current.filter((entry) => entry.id !== entryId));
+    setRevealed((current) => {
+      const next = { ...current };
+      delete next[entryId];
+      return next;
+    });
+    setEditing((current) => current?.id === entryId ? null : current);
+    setDeleteTarget(null);
+    setDeleteNotice(alreadyGone ? "This entry was already removed." : "Entry permanently deleted.");
+    window.requestAnimationFrame(() => document.getElementById("vault-entries-title")?.focus());
   }
   const closeEntryEditor = () => {
     if (editing) {
@@ -1280,6 +1387,7 @@ function App() {
             {error}
           </p>
         )}
+        {deleteNotice && <p className="success" role="status">{deleteNotice}</p>}
         {(showCreate || editing) && (
           <section className="panel">
             <div className="section-heading">
@@ -1299,6 +1407,7 @@ function App() {
               editing={editing}
               onCancel={closeEntryEditor}
               onCreated={(entry) => {
+                if (deletedEntryIds.current.has(entry.id)) return;
                 replace(entry);
                 closeEntryEditor();
               }}
@@ -1309,7 +1418,7 @@ function App() {
           <div className="section-heading">
             <div>
               <p className="eyebrow">VAULT ENTRIES</p>
-              <h2>
+              <h2 id="vault-entries-title" tabIndex={-1}>
                 {entries.length ? "Protected passwords" : "Your vault is ready"}
               </h2>
             </div>
@@ -1450,6 +1559,16 @@ function App() {
                           </button>
                         </>
                       )}
+                      <button
+                        className="button danger"
+                        aria-label={`Delete ${entry.title}`}
+                        onClick={() => {
+                          setDeleteNotice("");
+                          setDeleteTarget({ id: entry.id, title: entry.title });
+                        }}
+                      >
+                        Delete
+                      </button>
                     </div>
                   </article>
                 );
@@ -1457,6 +1576,13 @@ function App() {
             </div>
           )}
         </section>
+        {deleteTarget && (
+          <DeleteEntryDialog
+            entry={deleteTarget}
+            onCancel={() => setDeleteTarget(null)}
+            onDeleted={(alreadyGone) => finishDeletion(deleteTarget.id, alreadyGone)}
+          />
+        )}
         <footer className="vault-footer">
           <div className="footer-clock">
             <time dateTime={currentServerDate.toISOString()}>{clockTime(currentServerDate, session.display_timezone)}</time>

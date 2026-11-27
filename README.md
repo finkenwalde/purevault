@@ -107,6 +107,7 @@ The backend uses **Django**, a Python web framework, for sign-in, data storage, 
 - **Sign-in and sessions.** Django hashes the master password, manages session cookies, and protects requests that change vault data with CSRF checks. Sessions expire after 10 minutes of inactivity.
 - **Vault encryption.** Saved passwords are encrypted with Fernet. The database and its encryption key are kept in separate Docker volumes.
 - **Unlock delays.** The server checks each request to reveal a password. It measures elapsed time while Purevault is running, so changing the browser clock cannot shorten the wait.
+- **Deleting an entry.** Select **Delete** on the entry and confirm with your current master password. This permanently removes it from the vault and ends any pending or active unlock for it.
 
 Anyone who controls the Docker host can bypass the app's controls. For details, see the [architecture and security boundary](docs/ARCHITECTURE.md).
 

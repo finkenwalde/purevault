@@ -310,6 +310,11 @@ fieldset legend {
 }
 .entry-confirmation p {
   line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.delete-entry-form {
+  display: grid;
+  gap: 14px;
 }
 .entry-grid {
   display: grid;

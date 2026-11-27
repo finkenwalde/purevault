@@ -10,6 +10,8 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.db.models import F
 from django.http import Http404, JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -286,8 +288,10 @@ def entries(request):
 
 
 @api_login_required
-@require_http_methods(["PUT"])
+@require_http_methods(["PUT", "DELETE"])
 def entry_detail(request, entry_id):
+    if request.method == "DELETE":
+        return _delete_owned_entry(request, entry_id)
     entry = _owned_entry(request, entry_id)
     try:
         data = _json_body(request)
@@ -309,6 +313,37 @@ def entry_detail(request, entry_id):
         return JsonResponse({"entry": _entry_metadata(entry)})
     except ValidationError as exc:
         return _error(exc)
+    except VaultEntry.DoesNotExist as exc:
+        raise Http404 from exc
+
+
+def _delete_owned_entry(request, entry_id):
+    owned = VaultEntry.objects.filter(pk=entry_id, owner=request.user)
+    if not owned.exists():
+        return _error("This entry no longer exists.", 404)
+    try:
+        data = _json_body(request)
+        current = data.get("current_password")
+        if set(data) != {"current_password"} or not isinstance(current, str) or not 1 <= len(current) <= 4096:
+            raise ValidationError("Enter your current master password.")
+        current.encode("utf-8")
+    except UnicodeError:
+        return _error("Enter valid text for the current master password.")
+    except ValidationError as exc:
+        return _error(exc)
+
+    original_hash = request.user.password
+    if not check_password(current, original_hash):
+        return _error("Current master password is incorrect.", 403)
+    with transaction.atomic():
+        # Begin with a SQLite write, and reject stale verification after a password change.
+        verified = User.objects.filter(pk=request.user.pk, password=original_hash)
+        if not verified.update(last_login=F("last_login")):
+            return _error("The master password changed. Sign in again.", 409)
+        deleted, _ = owned.delete()  # Django cascades to the unlock grant in this transaction.
+    if not deleted:
+        return _error("This entry no longer exists.", 404)
+    return JsonResponse({"ok": True})
 
 
 @api_login_required
@@ -324,6 +359,8 @@ def unlock_start(request, entry_id):
         return JsonResponse({"entry": _entry_metadata(entry), "created": created})
     except ValidationError as exc:
         return _error(exc)
+    except VaultEntry.DoesNotExist as exc:
+        raise Http404 from exc
 
 
 @api_login_required
@@ -346,7 +383,10 @@ def relock(request, entry_id):
 @require_POST
 def reveal(request, entry_id):
     entry = _owned_entry(request, entry_id)
-    secret, state = release_secret(entry)
+    try:
+        secret, state = release_secret(entry)
+    except VaultEntry.DoesNotExist as exc:
+        raise Http404 from exc
     if secret is None:
         return _error("The entry is not currently available.", 423)
     return JsonResponse({"password": secret, "released_at": _iso(timezone.now())})

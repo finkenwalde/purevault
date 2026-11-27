@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import tempfile
@@ -7,7 +6,6 @@ from pathlib import Path
 from threading import Barrier
 from unittest.mock import patch
 
-from cryptography.fernet import Fernet
 from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -579,101 +577,43 @@ class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
         self.assertEqual(self.change().status_code, 200)
 
 
-class LegacyRestoreTests(RuntimeClockMixin, TestCase):
-    phrase = "synthetic legacy recovery phrase"
-    master = "neutral master sample phrase"
-    # Produced by Purevault's original v1 writer with synthetic data.
-    fixture = base64.b64decode(
-        "UFZCQUNLMDFQ75aGKi4ysJBZLmWvUNXSt8u2/AHlqtLRLTKMF/jK8iuOeu4+yoaDwtz"
-        "2Dp15bB/qTCWr4+95dWfx5ITTw0/DZEXtEsdXTHowYHPoAJuq+WuBcIf3xsvdjSuUEXS"
-        "nHCVNt/uIZD3IjXYrrhy8Y+0nll59dZunr2QvK5JZCcK325SpXbw1vU0im6PlHPaU+OF"
-        "PlVMnRakh3Rb9DiIO6ZDU4Y1zYyCtds2pJzRLd0DQ2VshUhUVZLlZviUIwzSQOXukF34"
-        "mhorD4ClE6hQz423cgqi425GLl1la2ub2L0BTI+aaKmqhA4UeiCJpLRPx5Ac1Ri8hrpY"
-        "vvEG2kLJHgbec3rytLV1iuhMwKrdHMXgT16vID7tu+pb020wEjxFiz+li9+FslNxT0/+"
-        "/vy2wc52ZbsUhaKaAbPJVebQbsBF/h7yrLgnKnfxErgZvMR6CQN5fAdJ1ugBI2DHFWpF"
-        "/JmwylkjrDlh7dojgEb+tqeye8ItacAXlYVW3IXX6RPmvfaKjiI24vDBkfYIl6Xo02hD"
-        "2pyYrKNxMex5YP6xDOIqMJR1+418r0goyKG/t2xG26fiEVw9rHw=="
-    )
-
-    def setUp(self):
+class RetiredBackupTests(RuntimeClockMixin, TestCase):
+    def test_backup_routes_are_closed_and_existing_files_are_preserved(self):
         self.initialize_test_clock()
         self.addCleanup(self.env.stop)
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        self.root = Path(directory)
-        self.enterContext(override_settings(DATA_DIR=self.root, PUREVAULT_KEY_FILE=self.root / "source.key"))
-        self.user = User.objects.create_user("source-example", password=self.master)
-        self.client = Client()
-        force_login_active(self.client, self.user)
-        self.entry = VaultEntry.objects.create(
-            owner=self.user, title="Vault test title", encrypted_secret=encrypt_secret("example secret"),
-            unlock_delay_seconds=30, relock_policy="automatic", relock_after_seconds=60,
-        )
-        UserProfile.objects.create(user=self.user, display_timezone="Asia/Tokyo")
-
-    def submit_restore(self, client, data, phrase=None, master=None):
-        with self.mono(0):
-            return client.post("/api/backups/restore/", {
-                "backup": SimpleUploadedFile("example.pvbackup", data),
-                "passphrase": phrase or self.phrase,
-                "current_password": master or self.master,
-            })
-
-    def test_portable_restore_is_atomic_and_starts_a_full_locked_wait(self):
-        data = self.fixture
-        self.assertEqual(self.submit_restore(self.client, data).status_code, 409)
-
-        target = User.objects.create_user("target-example", password=self.master)
-        client = Client()
-        force_login_active(client, target)
-        (self.root / "target.key").write_bytes(Fernet.generate_key())
-        with override_settings(PUREVAULT_KEY_FILE=self.root / "target.key"):
-            self.assertEqual(self.submit_restore(client, data, phrase="wrong recovery phrase").status_code, 400)
-            self.assertEqual(self.submit_restore(client, data[:-1] + bytes([data[-1] ^ 1])).status_code, 400)
-            self.assertEqual(self.submit_restore(client, data, master="wrong master phrase").status_code, 403)
-            self.assertFalse(UserProfile.objects.filter(user=target).exists())
-            self.assertFalse(VaultEntry.objects.filter(owner=target).exists())
-            self.assertEqual(self.submit_restore(client, data).json(), {"restored": 2})
-            entry = VaultEntry.objects.get(owner=target, title="Vault test title")
-            manual = VaultEntry.objects.get(owner=target, title="Manual test title")
-            self.assertNotEqual(entry.encrypted_secret, self.entry.encrypted_secret)
-            self.assertEqual((entry.unlock_delay_seconds, entry.relock_after_seconds), (30, 60))
-            self.assertEqual((manual.unlock_delay_seconds, manual.relock_policy, manual.relock_after_seconds), (120, "manual", None))
-            self.assertEqual(UserProfile.objects.get(user=target).display_timezone, "Asia/Tokyo")
-            self.assertFalse(UnlockGrant.objects.filter(entry__owner=target).exists())
-            with self.mono(0):
-                self.assertEqual(grant_status(entry)[0], "locked")
-                self.assertEqual(start_unlock(entry)[1].eligible_runtime_ms, 30000)
-            self.set_runtime(29.999)
-            with self.mono(29.999):
-                self.assertEqual(release_secret(entry)[1], "waiting")
-            self.set_runtime(30)
-            with self.mono(30):
-                self.assertEqual(release_secret(entry), ("example secret", "available"))
-
-    def test_restore_requires_auth_csrf_and_bounds_uploads(self):
-        csrf = Client(enforce_csrf_checks=True)
-        force_login_active(csrf, self.user)
-        self.assertEqual(self.submit_restore(Client(), self.fixture).status_code, 401)
-        self.assertEqual(self.submit_restore(csrf, self.fixture).status_code, 403)
-        oversized = csrf.generic("POST", "/api/backups/restore/", b"x", CONTENT_LENGTH=str(20 * 1024 * 1024))
-        self.assertEqual(oversized.status_code, 413)
-
-    def test_retired_export_routes_cannot_serve_existing_files_or_shell(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(override_settings(DATA_DIR=root))
+        user = User.objects.create_user("legacy-backup-example")
+        force_login_active(self.client, user)
         name = "20261001T010203000001Z-0123456789abcdef0123456789abcdef.pvbackup"
-        existing = self.root / "backups" / str(self.user.pk) / name
+        existing = root / "backups" / str(user.pk) / name
         existing.parent.mkdir(parents=True)
-        existing.write_bytes(self.fixture)
+        contents = b"synthetic existing backup file"
+        existing.write_bytes(contents)
+
         with self.mono(0):
-            for path in ("/api/backups", "/api/backups/", "/api/backups/run/", f"/api/backups/files/{name}/"):
+            for path in (
+                "/api/backups",
+                "/api/backups/",
+                "/api/backups/run/",
+                "/api/backups/restore",
+                "/api/backups/restore/",
+                f"/api/backups/files/{name}/",
+            ):
                 for method in ("GET", "HEAD", "POST", "PUT"):
                     with self.subTest(path=path, method=method):
                         self.assertEqual(self.client.generic(method, path).status_code, 404)
-            self.assertEqual(self.client.get(f"/api/backups/files/{name}/", SCRIPT_NAME="/purevault").status_code, 404)
-        self.assertEqual(existing.read_bytes(), self.fixture)
+            upload = SimpleUploadedFile(name, contents)
+            response = self.client.post("/api/backups/restore/", {"backup": upload})
+            self.assertEqual(response.status_code, 404)
+            self.assertEqual(self.client.get("/api/backups/restore/", SCRIPT_NAME="/purevault").status_code, 404)
+
+        self.assertFalse(VaultEntry.objects.filter(owner=user).exists())
+        self.assertEqual(existing.read_bytes(), contents)
         self.assertNotIn("run_backup_scheduler", get_commands())
 
 
-class RestoreOnlyMigrationTests(TransactionTestCase):
+class RetiredBackupMigrationTests(TransactionTestCase):
     def test_upgrade_preserves_existing_backup_settings_and_vault_data(self):
         before = [("vault", "0007_backupsettings")]
         after = [("vault", "0008_retire_backup_settings")]

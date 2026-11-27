@@ -10,7 +10,6 @@ urlpatterns = [
     path("session/activity/", views.acknowledge_activity),
     path("account/password/", views.change_master_password),
     path("account/timezone/", views.display_timezone),
-    path("backups/restore/", views.backup_restore),
     path("entries/", views.entries),
     path("entries/<int:entry_id>/", views.entry_detail),
     path("entries/<int:entry_id>/unlock/", views.unlock_start),

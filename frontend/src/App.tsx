@@ -1,5 +1,4 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { RestoreBackupPanel } from "./RestoreBackupPanel";
 import {
   MEANINGFUL_ACTIVITY_EVENTS,
   advanceSessionGeneration,
@@ -80,7 +79,7 @@ async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
     credentials: "same-origin",
     cache: "no-store",
     headers: {
-      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
+      "Content-Type": "application/json",
       "X-CSRFToken": decodeURIComponent(cookie("csrftoken")),
       ...(options.headers || {}),
     },
@@ -664,11 +663,11 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
 
 const settingsTabs = [
   { id: "display-time", label: "Display time" },
-  { id: "backups", label: "Restore backup" },
   { id: "security", label: "Security" },
 ] as const;
 const settingsHashes = new Set([
   ...settingsTabs.map(({ id }) => `#${id}`),
+  "#backups",
   "#accountability-partners",
   "#email-notifications",
 ]);
@@ -862,12 +861,10 @@ function SettingsPanel({
   session,
   now,
   onSessionSaved,
-  onRestore,
 }: {
   session: Session;
   now: Date;
   onSessionSaved: () => void;
-  onRestore: () => void;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [zone, setZone] = useState(session.display_timezone);
@@ -976,11 +973,8 @@ function SettingsPanel({
           </div>
         </form>
       </div>
-      <div className="settings-section" id="backups" role="tabpanel" aria-labelledby="tab-backups" hidden={tab !== 1}>
-        {tab === 1 && <RestoreBackupPanel api={api} onRestore={onRestore} />}
-      </div>
-      <div className="settings-section" id="security" role="tabpanel" aria-labelledby="tab-security" hidden={tab !== 2}>
-        {tab === 2 && <SecurityPanel username={session.username} />}
+      <div className="settings-section" id="security" role="tabpanel" aria-labelledby="tab-security" hidden={tab !== 1}>
+        {tab === 1 && <SecurityPanel username={session.username} />}
       </div>
       </div>
     </section>
@@ -1214,7 +1208,6 @@ function App() {
             session={session}
             now={currentServerDate}
             onSessionSaved={loadSession}
-            onRestore={() => { void loadSession(); void loadEntries(); }}
           />
         </main>
       </>

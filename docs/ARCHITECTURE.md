@@ -30,7 +30,7 @@ The application key is not in the image or source tree. If encrypted rows exist 
 
 There is no Django admin route, application administrator login, staff/superuser exception, emergency unlock, export endpoint, or maintenance command that bypasses delays. A person controlling Docker, storage, keys, clock, process memory, backups, or executable code remains inside the trust boundary. Purevault does not claim tamper resistance or zero knowledge against that person.
 
-Purevault can import [legacy encrypted backups](BACKUPS.md) into an empty vault. Imported entries start locked. Anyone who holds a legacy file and its recovery passphrase can still decrypt that copy outside Purevault.
+Anyone who holds an encrypted export from an earlier release and its recovery passphrase can still decrypt that copy outside Purevault.
 
 First-run account creation is a tokenless browser flow for the loopback-only local deployment. An atomic installation-state claim permits exactly one account, and the presence of any existing account independently keeps setup closed if the state flag is inconsistent. Complete first-run setup before changing the loopback binding or exposing the service through a LAN or public reverse proxy.
 

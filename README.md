@@ -112,8 +112,6 @@ Anyone who controls the Docker host can bypass the app's controls. For details, 
 
 ## Other installation and maintenance options
 
-Purevault no longer creates portable password backups. If you already have one, see [Restore a legacy backup](docs/BACKUPS.md).
-
 See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 
 - the complete `docker run` option;

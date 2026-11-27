@@ -9,8 +9,8 @@ from django.db import IntegrityError, OperationalError, transaction
 from django.db.models import F
 from django.utils import timezone
 
-from vault.crypto import decrypt_secret, vault_cipher
-from vault.models import InstallationState, RuntimeClock, UnlockGrant, UserProfile, VaultEntry
+from vault.crypto import decrypt_secret
+from vault.models import InstallationState, RuntimeClock, UnlockGrant, VaultEntry
 
 
 CLOCK_CHECKPOINT_INTERVAL_SECONDS = 0.25
@@ -37,23 +37,6 @@ class ClockSnapshot:
 
 def setup_is_complete():
     return InstallationState.objects.filter(pk=1, configured=True).exists() or User.objects.exists()
-
-
-def restore_entries(owner_id, zone, entries):
-    cipher = vault_cipher() if entries else None
-    rows = []
-    for entry in entries:
-        values = dict(entry)
-        encrypted = cipher.encrypt(values.pop("password").encode("utf-8"))
-        rows.append(VaultEntry(owner_id=owner_id, encrypted_secret=encrypted, **values))
-    with transaction.atomic():
-        # Take the SQLite write lock before checking that the vault is still empty.
-        User.objects.filter(pk=owner_id).update(last_login=F("last_login"))
-        if VaultEntry.objects.filter(owner_id=owner_id).exists():
-            return False
-        VaultEntry.objects.bulk_create(rows)
-        UserProfile.objects.update_or_create(user_id=owner_id, defaults={"display_timezone": zone})
-        return True
 
 
 def create_initial_user(username, password):

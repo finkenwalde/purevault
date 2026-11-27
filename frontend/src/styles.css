@@ -642,11 +642,6 @@ footer {
   background: #edf4ef;
   border-color: #bfd1c6;
 }
-.backup-form {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
-}
 .timezone-form {
   display: grid;
   gap: 16px;
@@ -755,8 +750,7 @@ footer {
   border: 1px solid #bdd9c6;
 }
 @media (max-width: 760px) {
-  .settings-layout,
-  .backup-form {
+  .settings-layout {
     grid-template-columns: minmax(0, 1fr);
   }
   .suggestion {

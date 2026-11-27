@@ -9,20 +9,17 @@ from django.contrib.auth import authenticate, login, logout, update_session_auth
 from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
-from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig, ValidationError
-from django.db import OperationalError
+from django.core.exceptions import ValidationError
 from django.http import Http404, JsonResponse
-from django.http.multipartparser import MultiPartParserError
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
-from vault.backup_format import MAX_FILE_BYTES, InvalidBackup, unpack_backup
 from vault.crypto import encrypt_secret
 from vault.models import RuntimeClock, UserProfile, VaultEntry
 from vault.services import MAX_TRUSTED_CLOCK_GAP_MS
-from vault.services import ClockUnavailable, EntryNotAvailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, restore_entries, setup_is_complete, start_unlock, update_entry_if_available
+from vault.services import ClockUnavailable, EntryNotAvailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, setup_is_complete, start_unlock, update_entry_if_available
 from vault.session_activity import session_activity_is_valid, stamp_session_activity
 from vault.validation import validate_entry_payload
 
@@ -353,39 +350,4 @@ def reveal(request, entry_id):
     if secret is None:
         return _error("The entry is not currently available.", 423)
     return JsonResponse({"password": secret, "released_at": _iso(timezone.now())})
-
-
-BACKUP_BUSY = "Another vault operation is in progress. Try again shortly."
-RESTORE_EMPTY = "Restore requires an empty vault."
-
-
-def _correct_master_password(user, value):
-    return isinstance(value, str) and len(value) <= 4096 and user.check_password(value)
-
-
-@api_login_required
-@require_POST
-def backup_restore(request):
-    try:
-        if set(request.POST) != {"passphrase", "current_password"} or set(request.FILES) != {"backup"}:
-            return _error("Choose a backup file and enter both passwords.")
-        if any(len(request.POST.getlist(field)) != 1 for field in request.POST) or len(request.FILES.getlist("backup")) != 1:
-            return _error("Submit one file and one value per field.")
-        if not _correct_master_password(request.user, request.POST["current_password"]):
-            return _error("Current master password is incorrect.", 403)
-        if VaultEntry.objects.filter(owner=request.user).exists():
-            return _error(RESTORE_EMPTY, 409)
-        upload = request.FILES["backup"]
-        if upload.size > MAX_FILE_BYTES:
-            return _error("Upload a Purevault backup file up to 12 MiB.", 413)
-        zone, entries = unpack_backup(upload.read(MAX_FILE_BYTES + 1), request.POST["passphrase"])
-        if not restore_entries(request.user.pk, zone, entries):
-            return _error(RESTORE_EMPTY, 409)
-        return JsonResponse({"restored": len(entries)})
-    except (InvalidBackup, RequestDataTooBig, MultiPartParserError):
-        return _error("The backup could not be opened. Check the recovery passphrase and file.")
-    except OperationalError:
-        return _error(BACKUP_BUSY, 409)
-    except (OSError, ImproperlyConfigured):
-        return _error("Restore could not write to vault storage.", 503)
 

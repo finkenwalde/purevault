@@ -103,8 +103,6 @@ The standard Compose project creates `purevault_purevault_data` and `purevault_p
 
 If either volume is lost, recovery requires a copy of the missing database or its matching key. Keep their copies separate where practical. Anyone who has both can access the passwords outside Purevault's unlock delays.
 
-Purevault no longer generates portable password backups. An encrypted export from an earlier version can still be [restored into an empty vault](BACKUPS.md) with its original recovery passphrase.
-
 ## Updating safely
 
 Back up both volumes before updating. Do not overwrite an old extracted folder blindly, and do not delete volumes.

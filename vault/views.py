@@ -6,25 +6,24 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
 from django.contrib.auth import authenticate, login, logout, update_session_auth_hash
+from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import User
 from django.contrib.auth.password_validation import validate_password
-from django.core.exceptions import ValidationError
-from django.db import IntegrityError, transaction
-from django.http import Http404, JsonResponse
+from django.core.exceptions import ImproperlyConfigured, RequestDataTooBig, ValidationError
+from django.db import OperationalError
+from django.http import FileResponse, Http404, JsonResponse
+from django.http.multipartparser import MultiPartParserError
 from django.shortcuts import render
 from django.utils import timezone
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
+from vault import backups
+from vault.backup_format import MAX_FILE_BYTES, InvalidBackup, create_recovery_bundle, unpack_backup
 from vault.crypto import encrypt_secret
-from vault.mail_service import (
-    MAX_PARTNERS, clean_header, clean_partner_name, encrypted_transport_snapshot,
-    normalize_email, partner_event_email, queue_delivery, queue_summary, test_email,
-    transport_from_settings, transport_is_usable,
-)
-from vault.models import AccountabilityPartner, EmailSettings, MailDelivery, RuntimeClock, UserProfile, VaultEntry
+from vault.models import BackupSettings, RuntimeClock, UserProfile, VaultEntry
 from vault.services import MAX_TRUSTED_CLOCK_GAP_MS
-from vault.services import ClockUnavailable, EntryNotAvailable, MailRateLimited, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, setup_is_complete, start_unlock, update_entry_if_available
+from vault.services import ClockUnavailable, EntryNotAvailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock, create_initial_user, grant_status, release_secret, setup_is_complete, start_unlock, update_entry_if_available
 from vault.session_activity import session_activity_is_valid, stamp_session_activity
 from vault.validation import validate_entry_payload
 
@@ -99,52 +98,6 @@ def _owned_entry(request, entry_id):
         return VaultEntry.objects.get(pk=entry_id, owner=request.user)
     except VaultEntry.DoesNotExist as exc:
         raise Http404 from exc
-
-
-def _reauthenticate(request, data):
-    password = data.get("current_password", "")
-    if not isinstance(password, str) or not request.user.check_password(password):
-        raise ValidationError("Current master password is incorrect.")
-
-
-def _recent_event_count(owner, event_types, minutes):
-    return MailDelivery.objects.filter(
-        owner=owner,
-        event_type__in=event_types,
-        created_at__gte=timezone.now() - timedelta(minutes=minutes),
-    ).values("event_id").distinct().count()
-
-
-def _partner_json(partner):
-    return {"id": partner.id, "name": partner.name, "email": partner.email}
-
-
-def _email_settings_json(configuration):
-    if not configuration:
-        return {
-            "enabled": False, "host": "", "port": 587, "security": "starttls",
-            "username": "", "password_set": False, "from_email": "", "from_name": "",
-        }
-    return {
-        "enabled": configuration.enabled,
-        "host": configuration.host,
-        "port": configuration.port,
-        "security": configuration.security,
-        "username": configuration.username,
-        "password_set": bool(configuration.encrypted_password),
-        "from_email": configuration.from_email,
-        "from_name": configuration.from_name,
-    }
-
-
-def _configuration_warning(partner_count, configuration, summary):
-    if not partner_count:
-        return ""
-    if not transport_is_usable(transport_from_settings(configuration)):
-        return "Accountability partners are configured, but email sending is disabled or incomplete. Unlock reasons are still required and notices remain queued."
-    if summary["action_needed"]:
-        return "Some accountability emails need attention. Correct the email settings and queued messages will retry automatically."
-    return ""
 
 
 @require_GET
@@ -265,13 +218,33 @@ def acknowledge_activity(request):
 def change_master_password(request):
     try:
         data = _json_body(request)
-        if set(data) - {"current_password", "new_password"}:
+        if set(data) - {"current_password", "new_password", "new_password_confirmation"}:
             raise ValidationError("Unsupported password-change field.")
-        if not request.user.check_password(data.get("current_password", "")):
+        current = data.get("current_password")
+        new = data.get("new_password")
+        fields = (current, new)
+        if "new_password_confirmation" in data:
+            fields += (data["new_password_confirmation"],)
+        if any(not isinstance(value, str) or not 1 <= len(value) <= 4096 for value in fields):
+            raise ValidationError("Enter passwords of 1 to 4096 characters.")
+        try:
+            for value in fields:
+                value.encode("utf-8")
+        except UnicodeError as exc:
+            raise ValidationError("Enter valid text for each password.") from exc
+
+        original_hash = request.user.password
+        if not check_password(current, original_hash):
             return _error("Current password is incorrect.", 403)
-        validate_password(data.get("new_password", ""), user=request.user)
-        request.user.set_password(data["new_password"])
-        request.user.save(update_fields=["password"])
+        if "new_password_confirmation" in data and data["new_password_confirmation"] != new:
+            raise ValidationError("The new passwords do not match.")
+        validate_password(new, user=request.user)
+        replacement_hash = make_password(new)
+        # Only the request that still holds the verified hash can replace it.
+        changed = User.objects.filter(pk=request.user.pk, password=original_hash).update(password=replacement_hash)
+        if not changed:
+            return _error("The master password was changed in another session. Sign in again.", 409)
+        request.user.password = replacement_hash
         update_session_auth_hash(request, request.user)
         return JsonResponse({"ok": True})
     except ValidationError as exc:
@@ -298,188 +271,6 @@ def display_timezone(request):
         return JsonResponse({"display_timezone": name})
     except ValidationError as exc:
         return _error(exc)
-
-
-@api_login_required
-@require_GET
-def accountability_settings(request):
-    partners = list(AccountabilityPartner.objects.filter(owner=request.user))
-    configuration = EmailSettings.objects.filter(owner=request.user).first()
-    summary = queue_summary(request.user)
-    return JsonResponse({
-        "partners": [_partner_json(partner) for partner in partners],
-        "email": _email_settings_json(configuration),
-        "queue": summary,
-        "warning": _configuration_warning(len(partners), configuration, summary),
-        "limits": {"partners": MAX_PARTNERS, "reason_characters": 1000},
-    })
-
-
-@api_login_required
-@require_POST
-def partner_create(request):
-    try:
-        data = _json_body(request)
-        if set(data) - {"name", "email", "current_password"}:
-            raise ValidationError("Unsupported partner field.")
-        _reauthenticate(request, data)
-        name = clean_partner_name(data.get("name", ""))
-        email = normalize_email(data.get("email", ""), "Partner email")
-        with transaction.atomic():
-            User.objects.select_for_update().get(pk=request.user.pk)
-            if AccountabilityPartner.objects.filter(owner=request.user).count() >= MAX_PARTNERS:
-                raise ValidationError(f"At most {MAX_PARTNERS} accountability partners can be configured.")
-            if _recent_event_count(request.user, [MailDelivery.EventType.PARTNER_ADDED, MailDelivery.EventType.PARTNER_REMOVED, MailDelivery.EventType.PARTNER_ADDRESS_CHANGED], 60) >= 20:
-                return _error("Too many partner changes were requested. Try again later.", 429)
-            try:
-                partner = AccountabilityPartner.objects.create(owner=request.user, name=name, email=email)
-            except IntegrityError as exc:
-                raise ValidationError("That email address is already an accountability partner.") from exc
-            subject, body = partner_event_email(request.user, MailDelivery.EventType.PARTNER_ADDED, partner.name)
-            queue_delivery(owner=request.user, event_id=os.urandom(16).hex(), event_type=MailDelivery.EventType.PARTNER_ADDED, recipient_name=partner.name, recipient_email=partner.email, subject=subject, body=body)
-        return JsonResponse({"partner": _partner_json(partner)}, status=201)
-    except ValidationError as exc:
-        return _error(exc, 403 if "master password" in str(exc).lower() else 400)
-
-
-def _owned_partner(request, partner_id):
-    try:
-        return AccountabilityPartner.objects.get(pk=partner_id, owner=request.user)
-    except AccountabilityPartner.DoesNotExist as exc:
-        raise Http404 from exc
-
-
-@api_login_required
-@require_http_methods(["PUT", "DELETE"])
-def partner_detail(request, partner_id):
-    try:
-        data = _json_body(request)
-        allowed = {"current_password"} if request.method == "DELETE" else {"name", "email", "current_password"}
-        if set(data) - allowed:
-            raise ValidationError("Unsupported partner field.")
-        _reauthenticate(request, data)
-        with transaction.atomic():
-            partner = AccountabilityPartner.objects.select_for_update().get(pk=_owned_partner(request, partner_id).pk)
-            if _recent_event_count(request.user, [MailDelivery.EventType.PARTNER_ADDED, MailDelivery.EventType.PARTNER_REMOVED, MailDelivery.EventType.PARTNER_ADDRESS_CHANGED], 60) >= 20:
-                return _error("Too many partner changes were requested. Try again later.", 429)
-            if request.method == "DELETE":
-                subject, body = partner_event_email(request.user, MailDelivery.EventType.PARTNER_REMOVED, partner.name)
-                queue_delivery(owner=request.user, event_id=os.urandom(16).hex(), event_type=MailDelivery.EventType.PARTNER_REMOVED, recipient_name=partner.name, recipient_email=partner.email, subject=subject, body=body)
-                partner.delete()
-                return JsonResponse({"ok": True})
-            name = clean_partner_name(data.get("name", ""))
-            email = normalize_email(data.get("email", ""), "Partner email")
-            old_name, old_email = partner.name, partner.email
-            if email != old_email and AccountabilityPartner.objects.filter(owner=request.user, email=email).exclude(pk=partner.pk).exists():
-                raise ValidationError("That email address is already an accountability partner.")
-            partner.name, partner.email = name, email
-            partner.save(update_fields=["name", "email", "updated_at"])
-            if email != old_email:
-                subject, body = partner_event_email(request.user, MailDelivery.EventType.PARTNER_ADDRESS_CHANGED, old_name, f"Future notices will use {email}.")
-                queue_delivery(owner=request.user, event_id=os.urandom(16).hex(), event_type=MailDelivery.EventType.PARTNER_ADDRESS_CHANGED, recipient_name=old_name, recipient_email=old_email, subject=subject, body=body)
-                subject, body = partner_event_email(request.user, MailDelivery.EventType.PARTNER_ADDED, name, "This address will receive future notices.")
-                queue_delivery(owner=request.user, event_id=os.urandom(16).hex(), event_type=MailDelivery.EventType.PARTNER_ADDED, recipient_name=name, recipient_email=email, subject=subject, body=body)
-        return JsonResponse({"partner": _partner_json(partner)})
-    except ValidationError as exc:
-        return _error(exc, 403 if "master password" in str(exc).lower() else 400)
-
-
-def _validated_email_configuration(data, existing):
-    enabled = data.get("enabled")
-    if not isinstance(enabled, bool):
-        raise ValidationError("Enabled must be true or false.")
-    host = clean_header(data.get("host", ""), "SMTP server", 255)
-    try:
-        port = int(data.get("port"))
-    except (TypeError, ValueError) as exc:
-        raise ValidationError("SMTP port must be a whole number from 1 to 65535.") from exc
-    if not 1 <= port <= 65535:
-        raise ValidationError("SMTP port must be from 1 to 65535.")
-    security = data.get("security")
-    if security not in EmailSettings.Security.values:
-        raise ValidationError("Choose STARTTLS, SSL/TLS, or Unencrypted.")
-    username = clean_header(data.get("username", ""), "SMTP username", 255)
-    from_name = clean_header(data.get("from_name", ""), "From name", 100)
-    from_email_value = data.get("from_email", "")
-    from_email = normalize_email(from_email_value, "From email") if from_email_value else ""
-    password = data.get("password", "")
-    clear_password = data.get("clear_password", False)
-    if not isinstance(password, str) or len(password) > 1024:
-        raise ValidationError("SMTP password must be at most 1024 characters.")
-    if not isinstance(clear_password, bool):
-        raise ValidationError("Clear password must be true or false.")
-    if password and clear_password:
-        raise ValidationError("Enter a replacement password or remove the saved password, not both.")
-    endpoint_changed = bool(existing) and (host, port, security, username) != (existing.host, existing.port, existing.security, existing.username)
-    if existing and existing.encrypted_password and endpoint_changed and not password and not clear_password:
-        raise ValidationError("The SMTP endpoint or username changed. Enter the password for the new destination or explicitly remove the saved password.")
-    encrypted_password = existing.encrypted_password if existing and not clear_password else None
-    if password:
-        from vault.crypto import encrypt_text
-        encrypted_password = encrypt_text(password)
-    password_present = bool(encrypted_password)
-    if bool(username) != password_present:
-        raise ValidationError("Enter both an SMTP username and password, or clear both for an unauthenticated relay.")
-    if enabled and (not host or not from_email):
-        raise ValidationError("SMTP server and From email are required when email notifications are enabled.")
-    return {"enabled": enabled, "host": host, "port": port, "security": security, "username": username, "encrypted_password": encrypted_password, "from_email": from_email, "from_name": from_name}
-
-
-@api_login_required
-@require_http_methods(["PUT"])
-def email_settings_update(request):
-    try:
-        data = _json_body(request)
-        if set(data) - {"enabled", "host", "port", "security", "username", "password", "clear_password", "from_email", "from_name"}:
-            raise ValidationError("Unsupported email setting.")
-        with transaction.atomic():
-            existing = EmailSettings.objects.select_for_update().filter(owner=request.user).first()
-            previous_snapshot = encrypted_transport_snapshot(existing)
-            values = _validated_email_configuration(data, existing)
-            before = _email_settings_json(existing)
-            if existing:
-                for field, value in values.items():
-                    setattr(existing, field, value)
-                existing.revision += 1
-                existing.save()
-                configuration = existing
-            else:
-                configuration = EmailSettings.objects.create(owner=request.user, **values)
-            if transport_is_usable(transport_from_settings(configuration)):
-                MailDelivery.objects.filter(owner=request.user, status=MailDelivery.Status.PENDING).update(
-                    next_attempt_at=timezone.now(), needs_attention=False, last_error="",
-                )
-            after = _email_settings_json(configuration)
-            changed = before != after or bool(data.get("password")) or data.get("clear_password") is True
-            if changed:
-                event_type = MailDelivery.EventType.NOTIFICATIONS_DISABLED if before["enabled"] and not after["enabled"] else MailDelivery.EventType.SMTP_CONFIGURATION_CHANGED
-                event_id = os.urandom(16).hex()
-                for partner in AccountabilityPartner.objects.filter(owner=request.user):
-                    subject, body = partner_event_email(request.user, event_type, partner.name)
-                    queue_delivery(owner=request.user, event_id=event_id, event_type=event_type, recipient_name=partner.name, recipient_email=partner.email, subject=subject, body=body, transport_snapshot=previous_snapshot)
-        return JsonResponse({"email": _email_settings_json(configuration), "queue": queue_summary(request.user)})
-    except ValidationError as exc:
-        return _error(exc, 403 if "master password" in str(exc).lower() else 400)
-
-
-@api_login_required
-@require_POST
-def email_test(request):
-    try:
-        data = _json_body(request)
-        if set(data) - {"destination"}:
-            raise ValidationError("Unsupported test-email field.")
-        destination = normalize_email(data.get("destination", ""), "Test destination")
-        configuration = EmailSettings.objects.filter(owner=request.user).first()
-        if not transport_is_usable(transport_from_settings(configuration)):
-            raise ValidationError("Enable and complete email settings before sending a test.")
-        if _recent_event_count(request.user, [MailDelivery.EventType.TEST], 15) >= 3:
-            return _error("Too many test emails were requested. Try again later.", 429)
-        subject, body = test_email(request.user)
-        queue_delivery(owner=request.user, event_id=os.urandom(16).hex(), event_type=MailDelivery.EventType.TEST, recipient_name="", recipient_email=destination, subject=subject, body=body)
-        return JsonResponse({"message": "Test email queued. Check delivery status; Accepted by mail server does not guarantee inbox delivery."}, status=202)
-    except ValidationError as exc:
-        return _error(exc, 403 if "master password" in str(exc).lower() else 400)
 
 
 @api_login_required
@@ -530,13 +321,11 @@ def unlock_start(request, entry_id):
     entry = _owned_entry(request, entry_id)
     try:
         data = _json_body(request)
-        if set(data) - {"reason"}:
+        if data:
             raise ValidationError("Unsupported unlock field.")
-        state, grant, created = start_unlock(entry, data.get("reason"))
+        _, _, created = start_unlock(entry)
         entry.refresh_from_db()
         return JsonResponse({"entry": _entry_metadata(entry), "created": created})
-    except MailRateLimited as exc:
-        return _error(exc, 429)
     except ValidationError as exc:
         return _error(exc)
 
@@ -565,4 +354,124 @@ def reveal(request, entry_id):
     if secret is None:
         return _error("The entry is not currently available.", 423)
     return JsonResponse({"password": secret, "released_at": _iso(timezone.now())})
+
+
+BACKUP_BUSY = "Another vault operation is in progress. Try again shortly."
+RESTORE_EMPTY = "Restore requires an empty vault."
+
+
+def _correct_master_password(user, value):
+    return isinstance(value, str) and len(value) <= 4096 and user.check_password(value)
+
+
+@api_login_required
+@require_http_methods(["GET", "PUT"])
+def backup_settings(request):
+    owner_id = request.user.pk
+    if request.method == "PUT":
+        try:
+            data = _json_body(request)
+            if set(data) - {"interval_days", "retention", "passphrase", "confirmation", "current_password"}:
+                raise ValidationError("Unsupported backup setting.")
+            interval, retention = data.get("interval_days"), data.get("retention")
+            if type(interval) is not int or interval not in (0, 1, 7):
+                raise ValidationError("Choose no schedule, every 24 hours, or every 7 days.")
+            if type(retention) is not int or not 1 <= retention <= 30:
+                raise ValidationError("Choose a retention count from 1 to 30.")
+            bundle = None
+            if set(data) & {"passphrase", "confirmation", "current_password"}:
+                master = data.get("current_password")
+                if not _correct_master_password(request.user, master):
+                    return _error("Current master password is incorrect.", 403)
+                phrase = data.get("passphrase")
+                if not isinstance(phrase, str) or not 20 <= len(phrase.strip()) <= len(phrase) <= 256:
+                    raise ValidationError("Use a strong recovery passphrase of 20 to 256 characters.")
+                if phrase == master:
+                    raise ValidationError("Choose a recovery passphrase separate from your master password.")
+                validate_password(phrase, user=request.user)
+                if phrase != data.get("confirmation"):
+                    raise ValidationError("The recovery passphrases do not match.")
+                bundle = create_recovery_bundle(phrase)
+            if not backups.configure(owner_id, interval, retention, bundle):
+                return _error("Set a recovery passphrase first.")
+        except ValidationError as exc:
+            return _error(exc)
+        except InvalidBackup:
+            return _error("The recovery passphrase could not be used.")
+        except OperationalError:
+            return _error(BACKUP_BUSY, 409)
+    profile = BackupSettings.objects.filter(owner_id=owner_id).first()
+    try:
+        files = [{"name": path.name, "bytes": path.stat().st_size} for path in backups.backup_files(owner_id)]
+    except OSError:
+        return _error("Backup storage is temporarily unavailable.", 503)
+    return JsonResponse({
+        "configured": profile is not None,
+        "interval_days": profile.interval_days if profile else 0,
+        "retention": profile.retention if profile else 7,
+        "next_run_at": _iso(profile.next_run_at) if profile else None,
+        "last_success_at": _iso(profile.last_success_at) if profile else None,
+        "last_error": profile.last_error if profile else "",
+        "running": bool(profile and profile.lease_until and profile.lease_until > timezone.now()),
+        "files": files,
+    })
+
+
+@api_login_required
+@require_POST
+def backup_now(request):
+    try:
+        if _json_body(request):
+            raise ValidationError("Backup now does not accept fields.")
+        if not BackupSettings.objects.filter(owner=request.user).exists():
+            return _error("Set a recovery passphrase first.")
+        if not backups.run_backup(request.user.pk):
+            return _error(BACKUP_BUSY, 409)
+        return JsonResponse({"ok": True}, status=201)
+    except ValidationError as exc:
+        return _error(exc)
+    except OperationalError:
+        return _error(BACKUP_BUSY, 409)
+    except InvalidBackup:
+        return _error(backups.BACKUP_FAILURE, 503)
+
+
+@api_login_required
+@require_GET
+def backup_download(request, name):
+    try:
+        path = backups.backup_path(request.user.pk, name)
+        if path is None:
+            raise Http404
+        handle = path.open("rb")
+    except OSError as exc:
+        raise Http404 from exc
+    return FileResponse(handle, as_attachment=True, filename=name, content_type="application/octet-stream")
+
+
+@api_login_required
+@require_POST
+def backup_restore(request):
+    try:
+        if set(request.POST) != {"passphrase", "current_password"} or set(request.FILES) != {"backup"}:
+            return _error("Choose a backup file and enter both passwords.")
+        if any(len(request.POST.getlist(field)) != 1 for field in request.POST) or len(request.FILES.getlist("backup")) != 1:
+            return _error("Submit one file and one value per field.")
+        if not _correct_master_password(request.user, request.POST["current_password"]):
+            return _error("Current master password is incorrect.", 403)
+        if VaultEntry.objects.filter(owner=request.user).exists():
+            return _error(RESTORE_EMPTY, 409)
+        upload = request.FILES["backup"]
+        if upload.size > MAX_FILE_BYTES:
+            return _error("Upload a Purevault backup file up to 12 MiB.", 413)
+        zone, entries = unpack_backup(upload.read(MAX_FILE_BYTES + 1), request.POST["passphrase"])
+        if not backups.restore_entries(request.user.pk, zone, entries):
+            return _error(RESTORE_EMPTY, 409)
+        return JsonResponse({"restored": len(entries)})
+    except (InvalidBackup, RequestDataTooBig, MultiPartParserError):
+        return _error("The backup could not be opened. Check the recovery passphrase and file.")
+    except OperationalError:
+        return _error(BACKUP_BUSY, 409)
+    except (OSError, ImproperlyConfigured):
+        return _error("Restore could not write to vault storage.", 503)
 

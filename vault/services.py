@@ -10,8 +10,7 @@ from django.db.models import F
 from django.utils import timezone
 
 from vault.crypto import decrypt_secret
-from vault.mail_service import clean_reason, queue_delivery, unlock_email
-from vault.models import AccountabilityPartner, InstallationState, MailDelivery, RuntimeClock, UnlockGrant, VaultEntry
+from vault.models import InstallationState, RuntimeClock, UnlockGrant, VaultEntry
 
 
 CLOCK_CHECKPOINT_INTERVAL_SECONDS = 0.25
@@ -27,10 +26,6 @@ class EntryNotAvailable(Exception):
 
 
 class ClockUnavailable(Exception):
-    pass
-
-
-class MailRateLimited(Exception):
     pass
 
 
@@ -160,10 +155,10 @@ def grant_state(entry, runtime_ms=None):
     return state, grant
 
 
-def start_unlock(entry, reason=None):
+def start_unlock(entry):
     for attempt in range(20):
         try:
-            return _start_unlock_once(entry, reason)
+            return _start_unlock_once(entry)
         except (IntegrityError, OperationalError) as exc:
             if isinstance(exc, OperationalError) and "locked" not in str(exc).lower():
                 raise
@@ -173,7 +168,7 @@ def start_unlock(entry, reason=None):
     raise OperationalError("Unable to start unlock after concurrent updates.")
 
 
-def _start_unlock_once(entry, reason=None):
+def _start_unlock_once(entry):
     with transaction.atomic():
         runtime_ms = advance_runtime_clock().elapsed_ms
         entry = VaultEntry.objects.select_for_update().get(pk=entry.pk)
@@ -183,15 +178,6 @@ def _start_unlock_once(entry, reason=None):
             if state != "locked":
                 return state, existing, False
             existing.delete()
-        partners = list(AccountabilityPartner.objects.filter(owner=entry.owner))
-        reason = clean_reason(reason, required=bool(partners)) if partners else ""
-        recent_events = MailDelivery.objects.filter(
-            owner=entry.owner,
-            event_type=MailDelivery.EventType.UNLOCK_REQUESTED,
-            created_at__gte=timezone.now() - timedelta(hours=1),
-        ).values("event_id").distinct().count()
-        if partners and recent_events >= 20:
-            raise MailRateLimited("Too many accountability email events were requested. Try again later.")
         eligible_runtime_ms = runtime_ms + entry.unlock_delay_seconds * 1000
         access_until_runtime_ms = eligible_runtime_ms + entry.relock_after_seconds * 1000 if entry.relock_policy == VaultEntry.RelockPolicy.AUTOMATIC else None
         now = timezone.now()
@@ -202,20 +188,6 @@ def _start_unlock_once(entry, reason=None):
             requested_runtime_ms=runtime_ms, eligible_runtime_ms=eligible_runtime_ms,
             access_until_runtime_ms=access_until_runtime_ms,
         )
-        if partners:
-            event_id = uuid.uuid4()
-            subject, body = unlock_email(entry.owner, entry, reason, now, eligible_estimate)
-            for partner in partners:
-                queue_delivery(
-                    owner=entry.owner,
-                    event_id=event_id,
-                    event_type=MailDelivery.EventType.UNLOCK_REQUESTED,
-                    recipient_name=partner.name,
-                    recipient_email=partner.email,
-                    subject=subject,
-                    body=body,
-                    now=now,
-                )
         return "waiting", grant, True
 
 

@@ -4,11 +4,11 @@ The following features are approved for implementation and review one at a time.
 
 ## 1. Automatic inactivity sign-out
 
-Implemented: authenticated sessions expire after 10 minutes without meaningful keyboard, pointer, or touch activity. Background polling does not extend the session, and expiry does not change vault grants or queued mail.
+Implemented: authenticated sessions expire after 10 minutes without meaningful keyboard, pointer, or touch activity. Background polling does not extend the session, and expiry does not change vault grants.
 
 ## 2. Activity history
 
-Add an owner-scoped timeline covering unlock requests and reasons, cancellation, reveal, relock, partner and email-configuration changes, and email delivery status. It must contain no passwords, define retention explicitly, and state honestly that a host administrator remains inside the trust boundary.
+Add an owner-scoped timeline covering unlock requests, cancellation, reveal, and relock. It must contain no passwords, define retention explicitly, and state honestly that a host administrator remains inside the trust boundary.
 
 ## 3. Lock all
 
@@ -24,6 +24,8 @@ Add a cryptographically secure generator for entry creation with configurable le
 
 ## 6. Recoverable Trash and deletion
 
-Add a simple Trash workflow with automatic permanent deletion after 30 days. Moving an entry to Trash cancels its pending grant; trashed entries cannot be unlocked or revealed. Restoring an entry returns it locked and requires a fresh full delay. Permanent deletion requires explicit confirmation and the current master password. Queued accountability notices remain independent of entry deletion. Safe purge scheduling and retention details must be finalized during this item.
+Add a simple Trash workflow with automatic permanent deletion after 30 days. Moving an entry to Trash cancels its pending grant; trashed entries cannot be unlocked or revealed. Restoring an entry returns it locked and requires a fresh full delay. Permanent deletion requires explicit confirmation and the current master password. Safe purge scheduling and retention details must be finalized during this item.
+
+Portable encrypted backups are implemented separately. See [the recovery guide](BACKUPS.md).
 
 There is no Archive feature in this roadmap.

@@ -12,6 +12,7 @@
 data/
 runtime/
 backups/
+*.pvbackup
 *.backup
 *.bak
 *.log
@@ -27,6 +28,7 @@ venv/
 
 # Frontend
 node_modules/
+*.tsbuildinfo
 frontend/dist/
 
 # Django generated files

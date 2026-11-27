@@ -1,4 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { BackupsPanel } from "./BackupsPanel";
 import {
   MEANINGFUL_ACTIVITY_EVENTS,
   advanceSessionGeneration,
@@ -32,32 +33,6 @@ type Session = {
   display_timezone_is_default: boolean;
   signed_out_reason: "inactivity" | null;
 };
-type Partner = { id: number; name: string; email: string };
-type EmailConfiguration = {
-  enabled: boolean;
-  host: string;
-  port: number;
-  security: "starttls" | "ssl" | "none";
-  username: string;
-  password_set: boolean;
-  from_email: string;
-  from_name: string;
-};
-type QueueSummary = {
-  pending: number;
-  sending: number;
-  action_needed: number;
-  accepted: number;
-  latest_error: string;
-};
-type AccountabilitySettings = {
-  partners: Partner[];
-  email: EmailConfiguration;
-  queue: QueueSummary;
-  warning: string;
-  limits: { partners: number; reason_characters: number };
-};
-
 type SessionEndedDetail = { reason: "inactivity" | "explicit" | "authentication" };
 const SESSION_EVENT_KEY = "purevault-session-ended";
 
@@ -98,17 +73,26 @@ function cookie(name: string) {
   );
 }
 
-async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+async function api<T>(path: string, options: RequestInit = {}, read?: (response: Response) => Promise<T>): Promise<T> {
   const requestGeneration = captureSessionGeneration();
   const response = await fetch(`/api${path}`, {
     ...options,
     credentials: "same-origin",
+    cache: "no-store",
     headers: {
-      "Content-Type": "application/json",
+      ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
       "X-CSRFToken": decodeURIComponent(cookie("csrftoken")),
       ...(options.headers || {}),
     },
   });
+  if (!responseBelongsToCurrentSession(requestGeneration))
+    throw new Error("The session ended before this response completed.");
+  if (read && response.ok) {
+    const result = await read(response);
+    if (!responseBelongsToCurrentSession(requestGeneration))
+      throw new Error("The session ended before this response completed.");
+    return result;
+  }
   const data = await response
     .json()
     .catch(() => ({ error: "The server returned an unreadable response." }));
@@ -633,16 +617,17 @@ function Auth({ session, refresh }: { session: Session; refresh: () => void }) {
 
 const settingsTabs = [
   { id: "display-time", label: "Display time" },
-  { id: "accountability-partners", label: "Accountability partners" },
-  { id: "email-notifications", label: "Email notifications" },
+  { id: "backups", label: "Backups" },
+  { id: "security", label: "Security" },
 ] as const;
-
-function settingsHashIndex() {
-  return settingsTabs.findIndex(({ id }) => window.location.hash === `#${id}`);
-}
+const settingsHashes = new Set([
+  ...settingsTabs.map(({ id }) => `#${id}`),
+  "#accountability-partners",
+  "#email-notifications",
+]);
 
 function clearSettingsHash() {
-  if (settingsHashIndex() >= 0) {
+  if (settingsHashes.has(window.location.hash)) {
     window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
   }
 }
@@ -759,72 +744,103 @@ function TimezonePicker({ zone, onSelect, onDraftChange }: {
   );
 }
 
+function SecurityPanel({ username }: { username: string | null }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  async function changePassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (busy) return;
+    const form = event.currentTarget;
+    const data = new FormData(form);
+    form.reset();
+    setError("");
+    setNotice("");
+    const newPassword = data.get("new_password");
+    const confirmation = data.get("new_password_confirmation");
+    if (newPassword !== confirmation) {
+      setError("The new passwords do not match. Enter all three fields again.");
+      return;
+    }
+
+    setBusy(true);
+    try {
+      await api("/account/password/", {
+        method: "POST",
+        body: JSON.stringify({
+          current_password: data.get("current_password"),
+          new_password: newPassword,
+          new_password_confirmation: confirmation,
+        }),
+      });
+      setNotice("Master password changed. Use your new password the next time you sign in.");
+    } catch (failure) {
+      setError((failure as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <h2>Change master password</h2>
+      <p>Changing your master password changes how you sign in and signs out other sessions.</p>
+      <form className="timezone-form" onSubmit={changePassword}>
+        {username && <input type="text" name="username" autoComplete="username" value={username} readOnly hidden />}
+        <div className="field">
+          <label htmlFor="security-current-password">Current master password</label>
+          <input id="security-current-password" name="current_password" type="password" autoComplete="current-password" maxLength={4096} required disabled={busy} />
+        </div>
+        <div className="field">
+          <label htmlFor="security-new-password">New master password</label>
+          <input id="security-new-password" name="new_password" type="password" autoComplete="new-password" minLength={12} maxLength={4096} aria-describedby="security-password-hint" required disabled={busy} />
+          <small id="security-password-hint" className="hint">Use at least 12 characters.</small>
+        </div>
+        <div className="field">
+          <label htmlFor="security-confirmation">Confirm new master password</label>
+          <input id="security-confirmation" name="new_password_confirmation" type="password" autoComplete="new-password" minLength={12} maxLength={4096} required disabled={busy} />
+        </div>
+        {error && <p className="error" role="alert">{error}</p>}
+        {notice && <p className="success" role="status">{notice}</p>}
+        <div className="form-actions">
+          <button className="button primary" disabled={busy}>{busy ? "Changing password…" : "Change master password"}</button>
+        </div>
+      </form>
+    </>
+  );
+}
+
 function SettingsPanel({
   session,
   now,
   onSessionSaved,
-  onAccountability,
+  onRestore,
 }: {
   session: Session;
   now: Date;
   onSessionSaved: () => void;
-  onAccountability: (value: AccountabilitySettings) => void;
+  onRestore: () => void;
 }) {
   const headingRef = useRef<HTMLHeadingElement>(null);
   const [zone, setZone] = useState(session.display_timezone);
   const [zoneDraft, setZoneDraft] = useState(false);
   const [pickerVersion, setPickerVersion] = useState(0);
-  const [activeTab, setActiveTab] = useState(() => Math.max(0, settingsHashIndex()));
-  function activateTab(index: number, focus = false) {
-    setActiveTab(index);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [tab, setTab] = useState(() => Math.max(0, settingsTabs.findIndex(({ id }) => window.location.hash === `#${id}`)));
+  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
+  useEffect(() => {
+    if (!settingsTabs.some(({ id }) => window.location.hash === `#${id}`)) clearSettingsHash();
+    headingRef.current?.focus();
+  }, []);
+  function selectTab(index: number, focus = false) {
+    setTab(index);
     const id = settingsTabs[index].id;
     window.history.replaceState(window.history.state, "", `#${id}`);
     if (focus) document.getElementById(`tab-${id}`)?.focus();
   }
-  const [settings, setSettings] = useState<AccountabilitySettings | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [partnerId, setPartnerId] = useState<number | null>(null);
-  const [partnerName, setPartnerName] = useState("");
-  const [partnerEmail, setPartnerEmail] = useState("");
-  const [partnerPassword, setPartnerPassword] = useState("");
-  const [testDestination, setTestDestination] = useState("");
-  const [emailForm, setEmailForm] = useState({
-    enabled: false,
-    host: "",
-    port: "587",
-    security: "starttls" as EmailConfiguration["security"],
-    username: "",
-    password: "",
-    clear_password: false,
-    from_email: "",
-    from_name: "",
-  });
-  const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
-  const load = useCallback(async (resetForm = false) => {
-    const value = await api<AccountabilitySettings>("/accountability/");
-    setSettings(value);
-    onAccountability(value);
-    if (resetForm) {
-      setEmailForm((current) => ({
-        ...current,
-        enabled: value.email.enabled,
-        host: value.email.host,
-        port: String(value.email.port),
-        security: value.email.security,
-        username: value.email.username,
-        password: "",
-        clear_password: false,
-        from_email: value.email.from_email,
-        from_name: value.email.from_name,
-      }));
-    }
-  }, [onAccountability]);
-  useEffect(() => {
-    load(true).catch((err) => setError((err as Error).message));
-  }, [load]);
-  useEffect(() => { headingRef.current?.focus(); }, []);
   async function saveTimezone(event: FormEvent) {
     event.preventDefault();
     if (zoneDraft) return;
@@ -844,85 +860,6 @@ function SettingsPanel({
       setBusy(false);
     }
   }
-  async function savePartner(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api(partnerId ? `/accountability/partners/${partnerId}/` : "/accountability/partners/", {
-        method: partnerId ? "PUT" : "POST",
-        body: JSON.stringify({ name: partnerName, email: partnerEmail, current_password: partnerPassword }),
-      });
-      setPartnerId(null);
-      setPartnerName("");
-      setPartnerEmail("");
-      setPartnerPassword("");
-      await load();
-      setNotice(partnerId ? "Partner updated and notices queued." : "Partner added and introduction queued.");
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function removePartner(partner: Partner) {
-    if (!partnerPassword) {
-      setError("Enter your current master password before removing a partner.");
-      return;
-    }
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api(`/accountability/partners/${partner.id}/`, {
-        method: "DELETE",
-        body: JSON.stringify({ current_password: partnerPassword }),
-      });
-      setPartnerPassword("");
-      await load();
-      setNotice("Partner removed and a removal notice queued to the previous address.");
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function saveEmail(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      await api("/accountability/email/", { method: "PUT", body: JSON.stringify(emailForm) });
-      await load(true);
-      setNotice("Email settings saved. Pending messages will retry automatically.");
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  async function sendTest(event: FormEvent) {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    setNotice("");
-    try {
-      const result = await api<{ message: string }>("/accountability/email/test/", {
-        method: "POST",
-        body: JSON.stringify({ destination: testDestination }),
-      });
-      setNotice(result.message);
-      await load();
-    } catch (err) {
-      setError((err as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-  const setEmail = (key: string, value: string | boolean) =>
-    setEmailForm((current) => ({ ...current, [key]: value }));
   return (
     <section className="settings-page" aria-labelledby="settings-title">
       <div className="section-heading">
@@ -931,7 +868,6 @@ function SettingsPanel({
           <h1 id="settings-title" ref={headingRef} tabIndex={-1}>Vault settings</h1>
         </div>
       </div>
-      {settings?.warning && <p className="warning" role="status">{settings.warning}</p>}
       {error && <p className="error" role="alert">{error}</p>}
       {notice && <p className="success" role="status">{notice}</p>}
 
@@ -941,130 +877,68 @@ function SettingsPanel({
             <button
               key={id}
               type="button"
-              role="tab"
               id={`tab-${id}`}
+              role="tab"
               aria-controls={id}
-              aria-selected={index === activeTab}
-              tabIndex={index === activeTab ? 0 : -1}
-              onClick={() => activateTab(index)}
+              aria-selected={tab === index}
+              tabIndex={tab === index ? 0 : -1}
+              onClick={() => selectTab(index)}
               onKeyDown={(event) => {
-                const count = settingsTabs.length;
                 let next: number;
                 switch (event.key) {
-                  case "ArrowUp": next = (index + count - 1) % count; break;
-                  case "ArrowDown": next = (index + 1) % count; break;
+                  case "ArrowUp": next = (index + settingsTabs.length - 1) % settingsTabs.length; break;
+                  case "ArrowDown": next = (index + 1) % settingsTabs.length; break;
                   case "Home": next = 0; break;
-                  case "End": next = count - 1; break;
+                  case "End": next = settingsTabs.length - 1; break;
                   default: return;
                 }
                 event.preventDefault();
-                activateTab(next, true);
+                selectTab(next, true);
+              }}
+            >{label}</button>
+          ))}
+        </div>
+      <div className="settings-section" id="display-time" role="tabpanel" aria-labelledby="tab-display-time" hidden={tab !== 0}>
+        <h2>Display timezone</h2>
+        <form onSubmit={saveTimezone} className="timezone-form">
+          <TimezonePicker key={pickerVersion} zone={zone} onSelect={setZone} onDraftChange={setZoneDraft} />
+          <div className="timezone-preview">
+            <span>Selected timezone</span>
+            <strong>{zoneLabel(zone)}</strong>
+            <time>{clockTime(now, zone)}</time>
+            <small>Display preference only; waiting periods and server timing are unchanged.</small>
+          </div>
+          <div className="suggestion">
+            <span>Browser timezone: <strong>{browserZone}</strong></span>
+            <button
+              type="button"
+              className="button ghost small"
+              onClick={() => {
+                setZone(browserZone);
+                setZoneDraft(false);
+                setPickerVersion((version) => version + 1);
               }}
             >
-              {label}
+              Use browser timezone
             </button>
-          ))}
-        </div>
-      <div className="settings-section" id="display-time" role="tabpanel" aria-labelledby="tab-display-time" hidden={activeTab !== 0}>
-        <h3>Display timezone</h3>
-        <form onSubmit={saveTimezone} className="timezone-form">
-        <TimezonePicker key={pickerVersion} zone={zone} onSelect={setZone} onDraftChange={setZoneDraft} />
-        <div className="timezone-preview">
-          <span>Selected timezone</span>
-          <strong>{zoneLabel(zone)}</strong>
-          <time>{clockTime(now, zone)}</time>
-          <small>Display preference only; waiting periods and server timing are unchanged.</small>
-        </div>
-        <div className="suggestion">
-          <span>
-            Browser timezone: <strong>{browserZone}</strong>
-          </span>
-          <button
-            type="button"
-            className="button ghost small"
-            onClick={() => {
-              setZone(browserZone);
-              setZoneDraft(false);
-              setPickerVersion((version) => version + 1);
-            }}
-          >
-            Use browser timezone
-          </button>
-        </div>
-        <div className="form-actions">
-          <button className="button primary" disabled={busy || zoneDraft}>
-            {busy ? "Saving…" : "Save timezone"}
-          </button>
-        </div>
-      </form>
-      </div>
-
-      <div className="settings-section" id="accountability-partners" role="tabpanel" aria-labelledby="tab-accountability-partners" hidden={activeTab !== 1}>
-        <div className="subheading">
-          <div>
-            <h3>Accountability partners</h3>
-            <p>Partners receive notifications only. They cannot access the vault or approve requests.</p>
           </div>
-          <span>{settings?.partners.length || 0}/{settings?.limits.partners || 20}</span>
-        </div>
-        <div className="partner-list">
-          {settings?.partners.map((partner) => (
-            <div className="partner-row" key={partner.id}>
-              <div><strong>{partner.name}</strong><small>{partner.email}</small></div>
-              <div className="row-actions">
-                <button type="button" className="button ghost small" onClick={() => { setPartnerId(partner.id); setPartnerName(partner.name); setPartnerEmail(partner.email); }}>Edit</button>
-                <button type="button" className="button danger small" disabled={busy} onClick={() => removePartner(partner)}>Remove</button>
-              </div>
-            </div>
-          ))}
-          {!settings?.partners.length && <p className="hint">No accountability partners are configured. Unlocking does not require a reason.</p>}
-        </div>
-        <form className="settings-grid" onSubmit={savePartner}>
-          <div className="field"><label htmlFor="partner-name">Partner name</label><input id="partner-name" value={partnerName} maxLength={100} onChange={(e) => setPartnerName(e.target.value)} required /></div>
-          <div className="field"><label htmlFor="partner-email">Partner email</label><input id="partner-email" type="email" value={partnerEmail} maxLength={254} onChange={(e) => setPartnerEmail(e.target.value)} required /></div>
-          <div className="field full"><label htmlFor="partner-master">Current master password</label><input id="partner-master" type="password" value={partnerPassword} onChange={(e) => setPartnerPassword(e.target.value)} autoComplete="current-password" required /><small className="hint">Required to add, edit, or remove a partner.</small></div>
-          <div className="form-actions full">
-            {partnerId && <button type="button" className="button ghost" onClick={() => { setPartnerId(null); setPartnerName(""); setPartnerEmail(""); }}>Cancel edit</button>}
-            <button className="button primary" disabled={busy || (settings?.partners.length === settings?.limits.partners && !partnerId)}>{partnerId ? "Save partner" : "Add partner"}</button>
+          <div className="form-actions">
+            <button className="button primary" disabled={busy || zoneDraft}>
+              {busy ? "Saving…" : "Save timezone"}
+            </button>
           </div>
         </form>
       </div>
-
-      <div className="settings-section" id="email-notifications" role="tabpanel" aria-labelledby="tab-email-notifications" hidden={activeTab !== 2}>
-        <h3>Email notifications</h3>
-        <p className="section-copy">Email is optional. If delivery fails, messages stay queued and retry; unlock timing never changes.</p>
-        <form className="settings-grid" onSubmit={saveEmail}>
-          <label className="toggle full"><input type="checkbox" checked={emailForm.enabled} onChange={(e) => setEmail("enabled", e.target.checked)} /><span><strong>Enable email delivery</strong><small>Disabling does not erase pending messages.</small></span></label>
-          <div className="field"><label htmlFor="smtp-host">SMTP server</label><input id="smtp-host" value={emailForm.host} maxLength={255} onChange={(e) => setEmail("host", e.target.value)} placeholder="smtp.example.com" /></div>
-          <div className="field"><label htmlFor="smtp-port">Port</label><input id="smtp-port" inputMode="numeric" value={emailForm.port} onChange={(e) => setEmail("port", e.target.value)} /><small className="hint">Usually 587 for STARTTLS or 465 for SSL/TLS.</small></div>
-          <div className="field"><label htmlFor="smtp-security">Connection security</label><select id="smtp-security" value={emailForm.security} onChange={(e) => setEmail("security", e.target.value)}><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">Unencrypted (advanced/local relay)</option></select></div>
-          <div className="field"><label htmlFor="smtp-user">SMTP username</label><input id="smtp-user" value={emailForm.username} maxLength={255} onChange={(e) => setEmail("username", e.target.value)} autoComplete="username" /><small className="hint">Leave username and password empty for a deliberate unauthenticated relay.</small></div>
-          <div className="field full">
-            <label htmlFor="smtp-password">SMTP password</label>
-            <div className="password-row">
-              <input id="smtp-password" type="password" value={emailForm.password} maxLength={1024} onChange={(e) => setEmailForm((current) => ({ ...current, password: e.target.value, clear_password: false }))} autoComplete="new-password" placeholder={settings?.email.password_set && !emailForm.clear_password ? "Saved password retained when blank" : "No saved password"} />
-              <button type="button" className="button danger" disabled={!settings?.email.password_set || emailForm.clear_password} onClick={() => setEmailForm((current) => ({ ...current, username: "", password: "", clear_password: true }))}>Remove saved password</button>
-            </div>
-            <small className="hint">Blank keeps the saved password. New text replaces it. Removing it also clears the username for an unauthenticated relay. Changing the server, port, security, or username requires a replacement password or explicit removal.</small>
-            {emailForm.clear_password && <small className="warning compact">The saved SMTP password and username will be removed when you save.</small>}
-          </div>
-          <div className="field"><label htmlFor="from-email">From email</label><input id="from-email" type="email" value={emailForm.from_email} maxLength={254} onChange={(e) => setEmail("from_email", e.target.value)} /></div>
-          <div className="field"><label htmlFor="from-name">From name (optional)</label><input id="from-name" value={emailForm.from_name} maxLength={100} onChange={(e) => setEmail("from_name", e.target.value)} /></div>
-          <div className="form-actions full"><button className="button primary" disabled={busy}>Save email settings</button></div>
-        </form>
-        <form className="test-form" onSubmit={sendTest}>
-          <div className="field"><label htmlFor="test-destination">Test destination</label><input id="test-destination" type="email" value={testDestination} onChange={(e) => setTestDestination(e.target.value)} placeholder="recipient@example.com" required /></div>
-          <button className="button secondary" disabled={busy || !settings?.email.enabled}>Send test email</button>
-          <small className="hint full">“Accepted by mail server” does not guarantee inbox delivery.</small>
-        </form>
-        <div className="queue-status" aria-live="polite">
-          <span><strong>{settings?.queue.pending || 0}</strong> pending</span>
-          <span><strong>{settings?.queue.sending || 0}</strong> sending</span>
-          <span><strong>{settings?.queue.action_needed || 0}</strong> need attention</span>
-          <span><strong>{settings?.queue.accepted || 0}</strong> accepted</span>
-          <button type="button" className="button ghost small" onClick={() => load()}>Refresh</button>
-        </div>
-        {settings?.queue.latest_error && <p className="warning">{settings.queue.latest_error}</p>}
+      <div className="settings-section" id="backups" role="tabpanel" aria-labelledby="tab-backups" hidden={tab !== 1}>
+        <BackupsPanel
+          active={tab === 1}
+          api={api}
+          formatDate={(date) => localTime(date, session.display_timezone)}
+          onRestore={onRestore}
+        />
+      </div>
+      <div className="settings-section" id="security" role="tabpanel" aria-labelledby="tab-security" hidden={tab !== 2}>
+        {tab === 2 && <SecurityPanel username={session.username} />}
       </div>
       </div>
     </section>
@@ -1074,14 +948,10 @@ function SettingsPanel({
 function App() {
   const [session, setSession] = useState<Session | null>(null),
     [entries, setEntries] = useState<Entry[]>([]);
-  const [accountability, setAccountability] = useState<AccountabilitySettings | null>(null);
   const [error, setError] = useState(""),
     [showCreate, setShowCreate] = useState(false),
     [editing, setEditing] = useState<Entry | null>(null),
-    [showSettings, setShowSettings] = useState(() => settingsHashIndex() >= 0),
-    [unlocking, setUnlocking] = useState<Entry | null>(null),
-    [unlockReason, setUnlockReason] = useState(""),
-    [unlockError, setUnlockError] = useState("");
+    [showSettings, setShowSettings] = useState(() => settingsHashes.has(window.location.hash));
   const [revealed, setRevealed] = useState<Record<number, string>>({}),
     [nowPerformance, setNowPerformance] = useState(performance.now()),
     [serverSync, setServerSync] = useState({
@@ -1098,14 +968,10 @@ function App() {
       const detail = (event as CustomEvent<SessionEndedDetail>).detail;
       setEntries([]);
       setRevealed({});
-      setAccountability(null);
       setShowCreate(false);
       setEditing(null);
       setShowSettings(false);
       clearSettingsHash();
-      setUnlocking(null);
-      setUnlockReason("");
-      setUnlockError("");
       setError("");
       setSession((current) => ({
         authenticated: false,
@@ -1153,37 +1019,22 @@ function App() {
       setError((err as Error).message);
     }
   }, []);
-  const acceptAccountability = useCallback((value: AccountabilitySettings) => {
-    setAccountability(value);
-  }, []);
-  const loadAccountability = useCallback(async () => {
-    try {
-      setAccountability(await api<AccountabilitySettings>("/accountability/"));
-    } catch (err) {
-      setError((err as Error).message);
-    }
-  }, []);
   useEffect(() => {
     loadSession();
   }, [loadSession]);
   useEffect(() => {
     if (session?.authenticated) {
       loadEntries();
-      loadAccountability();
     }
     else if (session?.authenticated === false) {
       setEntries([]);
       setRevealed({});
-      setAccountability(null);
       setShowCreate(false);
       setEditing(null);
       setShowSettings(false);
       clearSettingsHash();
-      setUnlocking(null);
-      setUnlockReason("");
-      setUnlockError("");
     }
-  }, [session?.authenticated, loadEntries, loadAccountability]);
+  }, [session?.authenticated, loadEntries]);
   useEffect(() => {
     const tick = window.setInterval(
       () => setNowPerformance(performance.now()),
@@ -1248,7 +1099,6 @@ function App() {
   async function action(
     entry: Entry,
     name: "unlock" | "cancel" | "relock" | "reveal",
-    reason = "",
   ) {
     setError("");
     try {
@@ -1261,17 +1111,13 @@ function App() {
       } else {
         const result = await api<{ entry: Entry }>(
           `/entries/${entry.id}/${name}/`,
-          { method: "POST", body: JSON.stringify(name === "unlock" ? { reason } : {}) },
+          { method: "POST", body: "{}" },
         );
         replace(result.entry);
       }
-      return true;
     } catch (err) {
-      const message = (err as Error).message;
-      if (name === "unlock" && unlocking) setUnlockError(message);
-      else setError(message);
+      setError((err as Error).message);
       loadEntries();
-      return false;
     }
   }
   const closeEntryEditor = () => {
@@ -1326,7 +1172,7 @@ function App() {
             session={session}
             now={currentServerDate}
             onSessionSaved={loadSession}
-            onAccountability={acceptAccountability}
+            onRestore={() => { void loadSession(); void loadEntries(); }}
           />
         </main>
       </>
@@ -1399,36 +1245,6 @@ function App() {
           <p className="error banner" role="alert">
             {error}
           </p>
-        )}
-        {unlocking && (
-          <div className="dialog-backdrop" role="presentation">
-            <form
-              className="dialog"
-              onSubmit={async (event) => {
-                event.preventDefault();
-                if (await action(unlocking, "unlock", unlockReason)) {
-                  setUnlocking(null);
-                  setUnlockReason("");
-                  setUnlockError("");
-                  loadAccountability();
-                }
-              }}
-            >
-              <p className="eyebrow">ACCOUNTABILITY NOTICE</p>
-              <h2>Why are you unlocking {unlocking.title}?</h2>
-              <p>Your reason and this entry title will be emailed separately to each accountability partner. Do not include a password or other secret.</p>
-              {unlockError && <p className="error" role="alert">{unlockError}</p>}
-              <div className="field">
-                <label htmlFor="unlock-reason">Reason for unlock</label>
-                <textarea id="unlock-reason" value={unlockReason} onChange={(event) => setUnlockReason(event.target.value)} maxLength={accountability?.limits.reason_characters || 1000} rows={5} required autoFocus />
-                <small className="hint">{unlockReason.length}/{accountability?.limits.reason_characters || 1000} characters</small>
-              </div>
-              <div className="form-actions">
-                <button type="button" className="button ghost" onClick={() => { setUnlocking(null); setUnlockReason(""); setUnlockError(""); }}>Cancel</button>
-                <button className="button primary">Start unlock and notify partners</button>
-              </div>
-            </form>
-          </div>
         )}
         {(showCreate || editing) && (
           <section className="panel">
@@ -1555,7 +1371,7 @@ function App() {
                       {entry.status === "locked" && (
                         <button
                           className="button primary"
-                          onClick={() => { if (accountability?.partners.length) { setUnlockError(""); setUnlocking(entry); } else action(entry, "unlock"); }}
+                          onClick={() => action(entry, "unlock")}
                         >
                           Start unlock
                         </button>

@@ -1,28 +1,30 @@
 import json
 import os
 import tempfile
-import smtplib
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
+from cryptography.fernet import Fernet
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.models import User
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import close_old_connections
 from django.db.models.query import QuerySet
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.utils import timezone
 
-from vault.crypto import decrypt_text, encrypt_secret, encrypt_text
-from vault.mail_service import _send_smtp, claim_due_delivery, process_claimed_delivery, queue_delivery
-from vault.models import AccountabilityPartner, EmailSettings, InstallationState, MailDelivery, RuntimeClock, UnlockGrant, UserProfile, VaultEntry
+from vault import backups
+from vault.backup_format import InvalidBackup, create_recovery_bundle
+from vault.crypto import encrypt_secret
+from vault.models import BackupSettings, InstallationState, RuntimeClock, UnlockGrant, UserProfile, VaultEntry
 from vault.session_activity import SESSION_ACTIVITY_GENERATION_KEY, SESSION_ACTIVITY_RUNTIME_KEY
 from vault.services import (
     ClockUnavailable, SetupAlreadyComplete, advance_runtime_clock, cancel_or_relock,
     create_initial_user, grant_status, initialize_runtime_clock, release_secret,
-    start_unlock, update_entry_if_available, EntryNotAvailable,
+    start_unlock,
 )
 
 
@@ -95,6 +97,17 @@ class VaultSecurityTests(RuntimeClockMixin, TestCase):
             self.assertEqual(self.post(f"/api/entries/{self.entry.id}/reveal/").status_code, 423)
         content = self.client.get("/api/entries/").content
         self.assertNotIn(b"<tag>", content); self.assertNotIn(b"exact", content)
+
+    def test_unlock_api_needs_no_reason_and_old_mail_routes_are_gone(self):
+        path = f"/api/entries/{self.entry.id}/unlock/"
+        with self.mono(0):
+            self.assertEqual(self.post(path, {"reason": "obsolete field"}).status_code, 400)
+            self.assertFalse(UnlockGrant.objects.filter(entry=self.entry).exists())
+            response = self.post(path)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["entry"]["status"], "waiting")
+            for suffix in ("", "partners/", "partners/1/", "email/", "email/test/"):
+                self.assertEqual(self.client.get(f"/api/accountability/{suffix}").status_code, 404)
 
     def test_exact_unlock_and_expiry_boundaries(self):
         self.start(); self.set_runtime(60)
@@ -302,7 +315,6 @@ class SessionInactivityTests(RuntimeClockMixin, TestCase):
     def test_polling_does_not_extend_but_real_activity_does(self):
         idle = self.active_client()
         self.assertEqual(self.request_at(idle, 100, "/api/entries/").status_code, 200)
-        self.assertEqual(self.request_at(idle, 500, "/api/accountability/").status_code, 200)
         self.assertEqual(idle.session[SESSION_ACTIVITY_RUNTIME_KEY], 0)
         self.assertEqual(self.request_at(idle, 600, "/api/entries/").status_code, 401)
 
@@ -346,15 +358,12 @@ class SessionInactivityTests(RuntimeClockMixin, TestCase):
         with self.mono(1099): self.assertEqual(first.post("/api/logout/", data="{}", content_type="application/json").status_code, 200)
         with self.mono(1099): self.assertEqual(second.get("/api/entries/").status_code, 401)
 
-    def test_expiry_preserves_grants_deadlines_and_mail_queue(self):
+    def test_expiry_preserves_grant_deadline(self):
         grant = UnlockGrant.objects.create(entry=self.entry, requested_at=timezone.now(), eligible_at=timezone.now(), requested_runtime_ms=0, eligible_runtime_ms=900000)
-        delivery = queue_delivery(owner=self.user, event_id=uuid.uuid4(), event_type=MailDelivery.EventType.TEST, recipient_name="Recipient", recipient_email="recipient@example.com", subject="Purevault: test", body="Synthetic queue record")
         client = self.active_client()
         self.assertEqual(self.request_at(client, 600, "/api/entries/").status_code, 401)
-        grant.refresh_from_db(); delivery.refresh_from_db()
+        grant.refresh_from_db()
         self.assertEqual(grant.eligible_runtime_ms, 900000)
-        self.assertEqual(delivery.status, MailDelivery.Status.PENDING)
-        self.assertEqual(MailDelivery.objects.count(), 1)
 
     def test_login_stamps_server_runtime_not_client_input(self):
         client = Client()
@@ -451,151 +460,7 @@ class RuntimeConcurrencyTests(RuntimeClockMixin, TransactionTestCase):
 
 
 @override_settings(PUREVAULT_DJANGO_SECRET_KEY="test-only")
-class AccountabilityTests(RuntimeClockMixin, TestCase):
-    def setUp(self):
-        self.initialize_test_clock()
-        self.key_dir = tempfile.TemporaryDirectory()
-        self.key_override = override_settings(PUREVAULT_KEY_FILE=Path(self.key_dir.name) / "app.key")
-        self.key_override.enable()
-        self.user = User.objects.create_user("account-owner", password="long-neutral-test-password")
-        self.other = User.objects.create_user("other-owner", password="other-neutral-test-password")
-        self.entry = VaultEntry.objects.create(owner=self.user, title="Example <entry>", encrypted_secret=encrypt_secret("never-email-this-secret"), unlock_delay_seconds=60, relock_policy="manual", relock_after_seconds=None)
-        self.client = Client(); force_login_active(self.client, self.user)
-
-    def tearDown(self):
-        self.key_override.disable(); self.key_dir.cleanup(); self.env.stop()
-
-    def post(self, path, data=None):
-        return self.client.post(path, data=json.dumps(data or {}), content_type="application/json")
-
-    def partner(self, email="partner@example.com", name="Example Partner"):
-        return AccountabilityPartner.objects.create(owner=self.user, name=name, email=email)
-
-    def test_reason_required_and_bounded_only_when_partners_exist(self):
-        self.partner()
-        for data in [{}, {"reason": "   "}, {"reason": "x" * 1001}]:
-            with self.mono(0): response = self.post(f"/api/entries/{self.entry.id}/unlock/", data)
-            self.assertEqual(response.status_code, 400)
-            self.assertFalse(UnlockGrant.objects.filter(entry=self.entry).exists())
-        AccountabilityPartner.objects.all().delete()
-        with self.mono(0): response = self.post(f"/api/entries/{self.entry.id}/unlock/")
-        self.assertEqual(response.status_code, 200)
-        self.assertTrue(response.json()["created"])
-
-    def test_unlock_snapshots_each_recipient_and_never_secret(self):
-        self.partner("one@example.com", "One"); self.partner("two@example.com", "Two")
-        with self.mono(0): response = self.post(f"/api/entries/{self.entry.id}/unlock/", {"reason": "A neutral reason <b>not HTML</b>"})
-        self.assertEqual(response.status_code, 200)
-        deliveries = list(MailDelivery.objects.filter(event_type=MailDelivery.EventType.UNLOCK_REQUESTED))
-        self.assertEqual(len(deliveries), 2)
-        self.assertEqual(len({item.event_id for item in deliveries}), 1)
-        self.assertCountEqual([item.recipient_email for item in deliveries], ["one@example.com", "two@example.com"])
-        payload = decrypt_text(deliveries[0].encrypted_payload)
-        self.assertIn("Example <entry>", payload)
-        self.assertIn("A neutral reason <b>not HTML</b>", payload)
-        self.assertNotIn("never-email-this-secret", payload)
-        self.assertNotIn("never-email-this-secret", response.content.decode())
-
-    def test_repeat_is_idempotent_and_cancel_restart_creates_new_event(self):
-        self.partner()
-        with self.mono(0): first = self.post(f"/api/entries/{self.entry.id}/unlock/", {"reason": "First request"})
-        self.assertTrue(first.json()["created"])
-        with self.mono(10): repeated = self.post(f"/api/entries/{self.entry.id}/unlock/", {})
-        self.assertFalse(repeated.json()["created"])
-        self.assertEqual(MailDelivery.objects.filter(event_type="unlock_requested").count(), 1)
-        with self.mono(10): self.post(f"/api/entries/{self.entry.id}/cancel/")
-        self.assertEqual(MailDelivery.objects.filter(event_type="unlock_requested").count(), 1)
-        self.set_runtime(20)
-        with self.mono(20): restarted = self.post(f"/api/entries/{self.entry.id}/unlock/", {"reason": "Second request"})
-        self.assertTrue(restarted.json()["created"])
-        self.assertEqual(MailDelivery.objects.filter(event_type="unlock_requested").count(), 2)
-        self.assertEqual(MailDelivery.objects.filter(event_type="unlock_requested").values("event_id").distinct().count(), 2)
-
-    def test_grant_and_outbox_roll_back_together(self):
-        self.partner()
-        with self.mono(0), patch("vault.services.queue_delivery", side_effect=RuntimeError("synthetic failure")), self.assertRaises(RuntimeError):
-            start_unlock(self.entry, "Reason")
-        self.assertFalse(UnlockGrant.objects.filter(entry=self.entry).exists())
-        self.assertFalse(MailDelivery.objects.exists())
-
-    def test_partner_owner_duplicate_reauth_and_csrf(self):
-        other_partner = AccountabilityPartner.objects.create(owner=self.other, name="Other", email="other@example.com")
-        self.assertEqual(self.client.get("/api/accountability/").json()["partners"], [])
-        bad = {"name": "Partner", "email": "PARTNER@example.com", "current_password": "wrong"}
-        self.assertEqual(self.post("/api/accountability/partners/", bad).status_code, 403)
-        good = {**bad, "current_password": "long-neutral-test-password"}
-        self.assertEqual(self.post("/api/accountability/partners/", good).status_code, 201)
-        self.assertEqual(AccountabilityPartner.objects.get(owner=self.user).email, "partner@example.com")
-        self.assertEqual(self.post("/api/accountability/partners/", good).status_code, 400)
-        self.assertEqual(self.client.delete(f"/api/accountability/partners/{other_partner.id}/", data=json.dumps({"current_password": "long-neutral-test-password"}), content_type="application/json").status_code, 404)
-        csrf = Client(enforce_csrf_checks=True); force_login_active(csrf, self.user)
-        self.assertEqual(csrf.post("/api/accountability/partners/", data=json.dumps(good), content_type="application/json").status_code, 403)
-
-    def test_partner_change_and_removal_notices_survive_deletion(self):
-        partner = self.partner()
-        changed = self.client.put(f"/api/accountability/partners/{partner.id}/", data=json.dumps({"name": "Updated", "email": "new@example.com", "current_password": "long-neutral-test-password"}), content_type="application/json")
-        self.assertEqual(changed.status_code, 200)
-        self.assertTrue(MailDelivery.objects.filter(event_type="partner_address_changed", recipient_email="partner@example.com").exists())
-        self.assertTrue(MailDelivery.objects.filter(event_type="partner_added", recipient_email="new@example.com").exists())
-        removed = self.client.delete(f"/api/accountability/partners/{partner.id}/", data=json.dumps({"current_password": "long-neutral-test-password"}), content_type="application/json")
-        self.assertEqual(removed.status_code, 200)
-        self.assertFalse(AccountabilityPartner.objects.filter(pk=partner.pk).exists())
-        self.assertTrue(MailDelivery.objects.filter(event_type="partner_removed", recipient_email="new@example.com").exists())
-
-    def test_smtp_password_encrypted_masked_and_validation(self):
-        payload = {"enabled": True, "host": "smtp.example.com", "port": 587, "security": "starttls", "username": "mailer", "password": "synthetic-smtp-password", "clear_password": False, "from_email": "vault@example.com", "from_name": "Purevault"}
-        response = self.client.put("/api/accountability/email/", data=json.dumps(payload), content_type="application/json")
-        self.assertEqual(response.status_code, 200)
-        configuration = EmailSettings.objects.get(owner=self.user)
-        self.assertNotIn(b"synthetic-smtp-password", bytes(configuration.encrypted_password))
-        for body in [response.content, self.client.get("/api/accountability/").content]:
-            self.assertNotIn(b"synthetic-smtp-password", body); self.assertNotIn(b"encrypted_password", body)
-        self.assertTrue(response.json()["email"]["password_set"])
-        half = {**payload, "username": "mailer", "clear_password": True, "password": ""}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(half), content_type="application/json").status_code, 400)
-        injected = {**half, "username": "", "host": "smtp.example.com\r\nBcc: attacker@example.com"}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(injected), content_type="application/json").status_code, 400)
-        legacy_reauth = {**payload, "current_password": "long-neutral-test-password"}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(legacy_reauth), content_type="application/json").status_code, 400)
-        cleared = {**payload, "username": "", "password": "", "clear_password": True}
-        cleared_response = self.client.put("/api/accountability/email/", data=json.dumps(cleared), content_type="application/json")
-        self.assertEqual(cleared_response.status_code, 200)
-        self.assertFalse(cleared_response.json()["email"]["password_set"])
-        self.assertEqual(EmailSettings.objects.get(owner=self.user).username, "")
-
-    def test_mail_failure_does_not_change_unlock_timing(self):
-        self.partner()
-        with self.mono(0): self.post(f"/api/entries/{self.entry.id}/unlock/", {"reason": "Timing remains independent"})
-        delivery, token = claim_due_delivery()
-        process_claimed_delivery(delivery, token)
-        self.set_runtime(60)
-        with self.mono(60):
-            self.assertEqual(grant_status(self.entry)[0], "available")
-            self.assertEqual(release_secret(self.entry)[0], "never-email-this-secret")
-
-    def test_configuration_change_notice_prefers_previous_transport(self):
-        self.partner()
-        first = {"enabled": True, "host": "old.example.com", "port": 587, "security": "starttls", "username": "mailer", "password": "old-synthetic-password", "clear_password": False, "from_email": "vault@example.com", "from_name": "Purevault"}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(first), content_type="application/json").status_code, 200)
-        MailDelivery.objects.all().delete()
-        delayed = queue_delivery(owner=self.user, event_id=uuid.uuid4(), event_type=MailDelivery.EventType.TEST, recipient_name="Recipient", recipient_email="recipient@example.com", subject="Purevault: test", body="Synthetic test")
-        MailDelivery.objects.filter(pk=delayed.pk).update(next_attempt_at=timezone.now() + timedelta(hours=1), needs_attention=True, last_error="Synthetic prior failure")
-        unsafe_reuse = {**first, "host": "new.example.com", "password": ""}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(unsafe_reuse), content_type="application/json").status_code, 400)
-        second = {**unsafe_reuse, "password": "new-synthetic-password"}
-        self.assertEqual(self.client.put("/api/accountability/email/", data=json.dumps(second), content_type="application/json").status_code, 200)
-        delayed.refresh_from_db()
-        self.assertLessEqual(delayed.next_attempt_at, timezone.now())
-        self.assertFalse(delayed.needs_attention)
-        self.assertEqual(delayed.last_error, "")
-        notice = MailDelivery.objects.get(event_type="smtp_configuration_changed")
-        snapshot = decrypt_text(notice.encrypted_transport_snapshot)
-        self.assertIn("old.example.com", snapshot)
-        self.assertNotIn("new.example.com", snapshot)
-
-
-@override_settings(PUREVAULT_DJANGO_SECRET_KEY="test-only")
-class UnlockMailConcurrencyTests(RuntimeClockMixin, TransactionTestCase):
+class UnlockConcurrencyTests(RuntimeClockMixin, TransactionTestCase):
     def setUp(self):
         self.initialize_test_clock()
         self.key_dir = tempfile.TemporaryDirectory()
@@ -603,100 +468,224 @@ class UnlockMailConcurrencyTests(RuntimeClockMixin, TransactionTestCase):
         self.key_override.enable()
         self.user = User.objects.create_user("concurrent-owner", password="neutral-concurrent-password")
         self.entry = VaultEntry.objects.create(owner=self.user, title="Concurrent example", encrypted_secret=encrypt_secret("synthetic-secret"), unlock_delay_seconds=60, relock_policy="manual", relock_after_seconds=None)
-        AccountabilityPartner.objects.create(owner=self.user, name="Partner", email="partner@example.com")
 
     def tearDown(self):
         self.key_override.disable(); self.key_dir.cleanup(); self.env.stop()
 
-    def test_concurrent_starts_create_one_grant_and_one_event(self):
+    def test_concurrent_starts_create_one_grant(self):
         barrier = Barrier(2)
-        def attempt(reason):
+        def attempt(_):
             close_old_connections(); barrier.wait()
             try:
                 with patch("vault.services.time.monotonic_ns", return_value=BASE_NS):
-                    return start_unlock(VaultEntry.objects.get(pk=self.entry.pk), reason)[2]
+                    return start_unlock(VaultEntry.objects.get(pk=self.entry.pk))[2]
             finally:
                 close_old_connections()
         with ThreadPoolExecutor(max_workers=2) as pool:
-            outcomes = list(pool.map(attempt, ["First reason", "Second reason"]))
+            outcomes = list(pool.map(attempt, range(2)))
         self.assertCountEqual(outcomes, [True, False])
         self.assertEqual(UnlockGrant.objects.filter(entry=self.entry).count(), 1)
-        self.assertEqual(MailDelivery.objects.filter(event_type="unlock_requested").count(), 1)
 
 
-@override_settings(PUREVAULT_DJANGO_SECRET_KEY="test-only")
-class MailDeliveryTests(RuntimeClockMixin, TestCase):
+class MasterPasswordChangeTests(RuntimeClockMixin, TestCase):
+    current = "neutral primary password phrase"
+    replacement = "neutral replacement password phrase"
+    path = "/api/account/password/"
+
     def setUp(self):
         self.initialize_test_clock()
-        self.key_dir = tempfile.TemporaryDirectory()
-        self.key_override = override_settings(PUREVAULT_KEY_FILE=Path(self.key_dir.name) / "app.key")
-        self.key_override.enable()
-        self.user = User.objects.create_user("mail-owner", password="neutral-mail-password")
+        self.addCleanup(self.env.stop)
+        self.user = User.objects.create_user("example-password-owner", password=self.current)
+        self.client = Client()
+        force_login_active(self.client, self.user)
 
-    def tearDown(self):
-        self.key_override.disable(); self.key_dir.cleanup(); self.env.stop()
+    def change(self, client=None, **overrides):
+        client = client if client is not None else self.client
+        data = {"current_password": self.current, "new_password": self.replacement, **overrides}
+        with self.mono(0):
+            return client.post(self.path, data, content_type="application/json")
 
-    def configure(self, security="starttls"):
-        return EmailSettings.objects.create(owner=self.user, enabled=True, host="smtp.example.com", port=587, security=security, username="mailer", encrypted_password=encrypt_text("synthetic-password"), from_email="vault@example.com", from_name="Purevault")
+    def test_authentication_csrf_and_invalid_password_payloads(self):
+        original = self.user.password
+        csrf_client = Client(enforce_csrf_checks=True)
+        force_login_active(csrf_client, self.user)
+        self.assertEqual(self.change(Client()).status_code, 401)
+        self.assertEqual(self.change(csrf_client).status_code, 403)
+        self.assertEqual(self.change(current_password="incorrect sample").status_code, 403)
+        invalid = [
+            {"current_password": None},
+            {"new_password": 42},
+            {"new_password": ""},
+            {"new_password": "x" * 4097},
+            {"new_password": "short"},
+            {"new_password": "\ud800"},
+            {"new_password_confirmation": False},
+            {"new_password_confirmation": "different replacement phrase"},
+        ]
+        for fields in invalid:
+            with self.subTest(fields=tuple(fields)):
+                self.assertEqual(self.change(**fields).status_code, 400)
+        with self.mono(0):
+            self.assertEqual(self.client.post(self.path, {}, content_type="application/json").status_code, 400)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.password, original)
 
-    def delivery(self):
-        return queue_delivery(owner=self.user, event_id=uuid.uuid4(), event_type=MailDelivery.EventType.TEST, recipient_name="Recipient", recipient_email="recipient@example.com", subject="Purevault: test", body="Plain <b>text</b> only")
+    def test_change_preserves_current_session_grants_encryption_and_backups(self):
+        directory = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        key_file = directory / "vault.key"
+        self.enterContext(override_settings(PUREVAULT_KEY_FILE=key_file))
+        entry = VaultEntry.objects.create(
+            owner=self.user, title="Example credential", encrypted_secret=encrypt_secret("synthetic secret"),
+            unlock_delay_seconds=45, relock_policy="automatic", relock_after_seconds=60,
+        )
+        with self.mono(0):
+            start_unlock(entry)
+        BackupSettings.objects.create(owner=self.user, public_key=b"test public", recovery_bundle=b"test wrapped")
+        original_entry = VaultEntry.objects.values().get(pk=entry.pk)
+        original_grant = UnlockGrant.objects.values().get(entry=entry)
+        original_backup = BackupSettings.objects.values().get(owner=self.user)
+        original_key = key_file.read_bytes()
+        other = Client()
+        force_login_active(other, self.user)
+        session_key = self.client.session.session_key
 
-    def test_smtp_modes_tls_verification_and_plain_text(self):
-        delivery = self.delivery()
-        for security, constructor, starttls in [("starttls", "SMTP", True), ("none", "SMTP", False), ("ssl", "SMTP_SSL", False)]:
-            transport = {"host": "smtp.example.com", "port": 587, "security": security, "username": "mailer", "password": "synthetic-password", "from_email": "vault@example.com", "from_name": "Purevault"}
-            client = MagicMock(); client.__enter__.return_value = client
-            with patch(f"vault.mail_service.smtplib.{constructor}", return_value=client) as factory:
-                _send_smtp(delivery, transport)
-            self.assertTrue(factory.called)
-            self.assertEqual(client.starttls.called, starttls)
-            message = client.send_message.call_args.args[0]
-            self.assertEqual(message.get_content_type(), "text/plain")
-            self.assertIn("Plain <b>text</b> only", message.get_content())
-            self.assertEqual(message["To"].addresses[0].addr_spec, "recipient@example.com")
+        self.assertEqual(self.change(new_password_confirmation=self.replacement).status_code, 200)
+        self.assertNotEqual(self.client.session.session_key, session_key)
+        self.assertEqual(self.client.session[SESSION_ACTIVITY_RUNTIME_KEY], 0)
+        with self.mono(0):
+            self.assertEqual(self.client.get("/api/entries/").status_code, 200)
+            self.assertEqual(other.get("/api/entries/").status_code, 401)
+            fresh = Client()
+            for password, code in ((self.current, 401), (self.replacement, 200)):
+                response = fresh.post("/api/login/", {
+                    "username": self.user.username, "password": password,
+                }, content_type="application/json")
+                self.assertEqual(response.status_code, code)
+        self.assertEqual(VaultEntry.objects.values().get(pk=entry.pk), original_entry)
+        self.assertEqual(UnlockGrant.objects.values().get(entry=entry), original_grant)
+        self.assertEqual(BackupSettings.objects.values().get(owner=self.user), original_backup)
+        self.assertEqual(key_file.read_bytes(), original_key)
 
-    def test_failure_retries_then_configuration_fix_accepts(self):
-        delivery = self.delivery()
-        claimed, token = claim_due_delivery()
-        self.assertEqual(claimed.pk, delivery.pk)
-        process_claimed_delivery(claimed, token)
-        delivery.refresh_from_db()
-        self.assertEqual(delivery.status, MailDelivery.Status.PENDING)
-        self.assertTrue(delivery.needs_attention)
-        self.assertEqual(delivery.attempt_count, 1)
+    def test_stale_request_cannot_overwrite_concurrent_change(self):
+        winner = make_password("different winner password phrase")
+
+        def hash_after_competing_write(password):
+            User.objects.filter(pk=self.user.pk).update(password=winner)
+            return make_password(password)
+
+        with patch("vault.views.make_password", side_effect=hash_after_competing_write):
+            self.assertEqual(self.change().status_code, 409)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.password, winner)
+
+    def test_previous_api_payload_still_works_without_confirmation(self):
+        self.assertEqual(self.change().status_code, 200)
+
+
+class BackupTests(RuntimeClockMixin, TestCase):
+    phrase = "sundial forest mint compass velvet"
+    master = "neutral master sample phrase"
+
+    def setUp(self):
+        self.initialize_test_clock()
+        self.addCleanup(self.env.stop)
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        self.root = Path(directory)
+        self.enterContext(override_settings(DATA_DIR=self.root, PUREVAULT_KEY_FILE=self.root / "source.key"))
+        self.user = User.objects.create_user("source-example", password=self.master)
+        self.client = Client()
+        force_login_active(self.client, self.user)
+        self.entry = VaultEntry.objects.create(
+            owner=self.user, title="Vault test title", encrypted_secret=encrypt_secret("example secret"),
+            unlock_delay_seconds=30, relock_policy="automatic", relock_after_seconds=60,
+        )
+        UserProfile.objects.create(user=self.user, display_timezone="Asia/Tokyo")
+
+    def configure(self):
+        return backups.configure(self.user.pk, 1, 1, create_recovery_bundle(self.phrase))
+
+    def submit_restore(self, client, data, phrase=None, master=None):
+        with self.mono(0):
+            return client.post("/api/backups/restore/", {
+                "backup": SimpleUploadedFile("example.pvbackup", data),
+                "passphrase": phrase or self.phrase,
+                "current_password": master or self.master,
+            })
+
+    def test_schedule_retains_previous_file_after_failed_durable_publish(self):
         self.configure()
-        MailDelivery.objects.filter(pk=delivery.pk).update(next_attempt_at=timezone.now())
-        claimed, token = claim_due_delivery()
-        process_claimed_delivery(claimed, token, sender=lambda item, transport: None)
-        delivery.refresh_from_db()
-        self.assertEqual(delivery.status, MailDelivery.Status.ACCEPTED)
-        self.assertEqual(delivery.attempt_count, 2)
+        self.assertTrue(backups.run_backup(self.user.pk))
+        old, = backups.backup_files(self.user.pk)
+        due = timezone.now() - timedelta(days=8)
+        BackupSettings.objects.filter(owner=self.user).update(next_run_at=due)
+        with patch("vault.backup_format._wrapping_key", side_effect=AssertionError("requires decryption")), \
+             patch("vault.backups._sync_directory", side_effect=OSError("synthetic failure")):
+            with self.assertRaises(InvalidBackup):
+                backups.run_backup(self.user.pk, scheduled=True)
+        self.assertEqual(backups.backup_files(self.user.pk), [old])
+        self.assertTrue(BackupSettings.objects.get(owner=self.user).last_error)
 
-    def test_timeout_backoff_and_expired_lease_recovery(self):
-        self.configure(); delivery = self.delivery()
-        claimed, token = claim_due_delivery()
-        process_claimed_delivery(claimed, token, sender=lambda item, transport: (_ for _ in ()).throw(TimeoutError()))
-        delivery.refresh_from_db()
-        self.assertEqual(delivery.status, MailDelivery.Status.PENDING)
-        self.assertGreater(delivery.next_attempt_at, timezone.now())
-        self.assertFalse(delivery.needs_attention)
-        MailDelivery.objects.filter(pk=delivery.pk).update(status=MailDelivery.Status.SENDING, next_attempt_at=timezone.now(), lease_expires_at=timezone.now() - timedelta(seconds=1), lease_token=uuid.uuid4())
-        recovered, new_token = claim_due_delivery()
-        self.assertEqual(recovered.pk, delivery.pk)
-        self.assertEqual(recovered.lease_token, new_token)
+        BackupSettings.objects.filter(owner=self.user).update(next_run_at=due)
+        with patch("vault.backup_format._wrapping_key", side_effect=AssertionError("requires decryption")):
+            self.assertTrue(backups.run_backup(self.user.pk, scheduled=True))
+            self.assertFalse(backups.run_backup(self.user.pk, scheduled=True))
+        new, = backups.backup_files(self.user.pk)
+        self.assertNotEqual(new, old)
+        self.assertFalse(old.exists())
+        self.assertGreater(BackupSettings.objects.get(owner=self.user).next_run_at, timezone.now())
 
-    def test_test_email_rate_limit_and_sanitized_provider_error(self):
-        self.configure(); client = Client(); force_login_active(client, self.user)
-        for index in range(3):
-            response = client.post("/api/accountability/email/test/", data=json.dumps({"destination": f"recipient{index}@example.com"}), content_type="application/json")
-            self.assertEqual(response.status_code, 202)
-        limited = client.post("/api/accountability/email/test/", data=json.dumps({"destination": "fourth@example.com"}), content_type="application/json")
-        self.assertEqual(limited.status_code, 429)
-        delivery = MailDelivery.objects.first()
-        MailDelivery.objects.filter(pk=delivery.pk).update(next_attempt_at=timezone.now())
-        claimed, token = claim_due_delivery()
-        process_claimed_delivery(claimed, token, sender=lambda item, transport: (_ for _ in ()).throw(smtplib.SMTPAuthenticationError(535, b"private provider response")))
-        claimed.refresh_from_db()
-        self.assertNotIn("private provider response", claimed.last_error)
-        self.assertIn("authentication failed", claimed.last_error.lower())
+    def test_portable_restore_is_atomic_and_starts_a_full_locked_wait(self):
+        self.configure()
+        with self.mono(0):
+            start_unlock(self.entry)
+        backups.run_backup(self.user.pk)
+        path, = backups.backup_files(self.user.pk)
+        with self.mono(0):
+            download = self.client.get(f"/api/backups/files/{path.name}/")
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("no-store", download["Cache-Control"])
+        data = b"".join(download.streaming_content)
+        download.close()
+        self.assertNotIn(b"Vault test title", data)
+        self.assertNotIn(b"example secret", data)
+        self.assertEqual(self.submit_restore(self.client, data).status_code, 409)
+
+        target = User.objects.create_user("target-example", password=self.master)
+        client = Client()
+        force_login_active(client, target)
+        (self.root / "target.key").write_bytes(Fernet.generate_key())
+        with override_settings(PUREVAULT_KEY_FILE=self.root / "target.key"):
+            self.assertEqual(self.submit_restore(client, data, phrase="wrong recovery phrase").status_code, 400)
+            self.assertEqual(self.submit_restore(client, data[:-1] + bytes([data[-1] ^ 1])).status_code, 400)
+            self.assertEqual(self.submit_restore(client, data, master="wrong master phrase").status_code, 403)
+            self.assertFalse(UserProfile.objects.filter(user=target).exists())
+            self.assertFalse(VaultEntry.objects.filter(owner=target).exists())
+            self.assertEqual(self.submit_restore(client, data).json(), {"restored": 1})
+            entry = VaultEntry.objects.get(owner=target)
+            self.assertNotEqual(entry.encrypted_secret, self.entry.encrypted_secret)
+            self.assertEqual((entry.unlock_delay_seconds, entry.relock_after_seconds), (30, 60))
+            self.assertEqual(UserProfile.objects.get(user=target).display_timezone, "Asia/Tokyo")
+            self.assertFalse(BackupSettings.objects.filter(owner=target).exists())
+            with self.mono(0):
+                self.assertEqual(grant_status(entry)[0], "locked")
+                self.assertEqual(start_unlock(entry)[1].eligible_runtime_ms, 30000)
+            self.set_runtime(29.999)
+            with self.mono(29.999):
+                self.assertEqual(release_secret(entry)[1], "waiting")
+            self.set_runtime(30)
+            with self.mono(30):
+                self.assertEqual(release_secret(entry), ("example secret", "available"))
+
+    def test_backup_endpoints_require_auth_csrf_and_master_for_recovery_setup(self):
+        data = {"passphrase": self.phrase, "confirmation": self.phrase, "interval_days": 0, "retention": 7}
+        csrf = Client(enforce_csrf_checks=True)
+        force_login_active(csrf, self.user)
+        with self.mono(0):
+            self.assertEqual(Client().get("/api/backups/").status_code, 401)
+            self.assertEqual(csrf.put("/api/backups/", data, content_type="application/json").status_code, 403)
+            self.assertEqual(self.client.put("/api/backups/", data, content_type="application/json").status_code, 403)
+            self.assertEqual(self.client.put("/api/backups/", {**data, "current_password": self.master}, content_type="application/json").status_code, 200)
+            self.assertEqual(csrf.post("/api/backups/run/", "{}", content_type="application/json").status_code, 403)
+            self.assertEqual(self.submit_restore(csrf, b"example").status_code, 403)
+            oversized = csrf.generic("POST", "/api/backups/restore/", b"x", CONTENT_LENGTH=str(20 * 1024 * 1024))
+            self.assertEqual(oversized.status_code, 413)

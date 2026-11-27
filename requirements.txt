@@ -1,5 +1,5 @@
-Django==5.2.7
-cryptography==46.0.3
-gunicorn==23.0.0
-whitenoise==6.11.0
+Django==5.2.19
+cryptography==50.0.2
+gunicorn==27.0.1
+whitenoise==6.12.0
 

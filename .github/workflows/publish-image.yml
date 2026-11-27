@@ -2,6 +2,12 @@ name: Publish container image
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Numeric release version (for example, 0.1.0)"
+        required: true
+        default: "0.1.0"
+        type: string
 
 env:
   IMAGE_NAME: ghcr.io/finkenwalde/purevault
@@ -19,14 +25,25 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      version: ${{ steps.release.outputs.version }}
     steps:
-      - name: Require the main branch
+      - name: Validate release selection
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         shell: bash
         run: |
-          if [[ "${GITHUB_REF}" != "refs/heads/main" ]]; then
-            echo "Container publication is allowed only from main." >&2
+          if [[ "${GITHUB_REPOSITORY}" != "finkenwalde/purevault" || "${GITHUB_REF}" != "refs/heads/main" ]]; then
+            echo "Run this workflow on finkenwalde/purevault's main branch." >&2
             exit 1
           fi
+          pattern='^0\.(0|[1-9][0-9]{0,8})\.(0|[1-9][0-9]{0,8})$'
+          if [[ ! "${REQUESTED_VERSION}" =~ ${pattern} ]]; then
+            echo "Use a numeric 0.MINOR.PATCH version, such as 0.1.0, with no leading zeros." >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "${REQUESTED_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Check out the selected commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -49,6 +66,8 @@ jobs:
   publish:
     name: Publish linux/amd64 image
     needs: verify
+    env:
+      RELEASE_VERSION: ${{ needs.verify.outputs.version }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -66,7 +85,9 @@ jobs:
             --platform linux/amd64 \
             --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${RELEASE_VERSION}" \
             --tag "${IMAGE_NAME}:${GITHUB_SHA}" \
+            --tag "${IMAGE_NAME}:${RELEASE_VERSION}" \
             --tag "${IMAGE_NAME}:latest" \
             .
 
@@ -119,10 +140,14 @@ jobs:
             echo "- Published source tag: \`${IMAGE_NAME}:${GITHUB_SHA}\`"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Push the latest tag
-        run: docker push "${IMAGE_NAME}:latest"
-
-      - name: Record the latest tag update
+      - name: Push and record the release version
         shell: bash
         run: |
+          docker push "${IMAGE_NAME}:${RELEASE_VERSION}"
+          echo "- Published release tag: \`${IMAGE_NAME}:${RELEASE_VERSION}\`" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Push and record the latest tag
+        shell: bash
+        run: |
+          docker push "${IMAGE_NAME}:latest"
           echo "- Updated moving tag: \`${IMAGE_NAME}:latest\`" >> "${GITHUB_STEP_SUMMARY}"

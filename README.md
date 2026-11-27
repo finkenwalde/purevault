@@ -22,6 +22,8 @@ On macOS or Linux, open a terminal and use `cd` to enter the extracted folder co
 
 ### 4. Start Purevault
 
+For an existing installation on port 8127, start with the [port upgrade steps](docs/DEPLOYMENT.md#upgrading-to-port-8080).
+
 Run this one command:
 
 ```powershell
@@ -38,11 +40,13 @@ Look for the `web` service to say `Up` and then `healthy`. You can also open Doc
 
 ### 5. Create your account
 
-Open [http://localhost:8127](http://localhost:8127) in your browser. Choose a username and a strong master password. This creates the installation's only account; there are no default credentials.
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080) in your browser. Choose a username and a strong master password. This creates the installation's only account.
 
-The default local setup does not require editing `.env`, entering a setup token, or installing Git.
+The default local setup uses Docker's loopback binding and works with zero environment configuration.
 
-Purevault signs you out after 10 minutes without keyboard, pointer, or touch activity. Automatic background refreshes do not keep a session open. Signing out does not cancel unlock requests, change access windows, or stop queued accountability emails.
+To change your master password, sign in and open **Settings → Security**. You’ll need your current password. Changing it keeps this session signed in and signs out other sessions. Keep a safe copy of your master password, as Purevault has no forgotten-password reset.
+
+Purevault signs you out after 10 minutes without keyboard, pointer, or touch activity. Automatic background refreshes do not keep a session open. Signing out does not cancel unlock requests or change access windows.
 
 ## Stop and start later
 
@@ -55,15 +59,11 @@ docker compose start
 
 Your account, entries, and encryption key are kept in Docker volumes and survive normal stops and starts. Unlock waits pause while Purevault is stopped and resume after it starts. Do not use `docker compose down --volumes`, because that deletes the stored data and encryption key.
 
-If something does not start, open Docker Desktop's **Containers** view, expand **purevault**, and read the `web` logs. Also confirm that Docker Desktop is running and that no other program is using port `8127`.
-
-## Optional accountability emails
-
-After signing in, open **Settings** to add accountability partners and configure an SMTP email account. Purevault can notify each partner when an unlock is requested and requires a written reason whenever at least one partner is configured.
-
-Email is optional. A missing or failing email configuration never changes an unlock timer: messages remain queued and retry after the configuration is corrected. Use **Send test email** before relying on notifications. “Accepted by mail server” means the SMTP server accepted the message, not that it is guaranteed to reach an inbox.
+If something does not start, open Docker Desktop's **Containers** view, expand **purevault**, and read the `web` logs. Check that Docker Desktop is running and port `8080` is free.
 
 ## Other installation and maintenance options
+
+Use [portable encrypted backups](docs/BACKUPS.md) to download an off-host recovery copy or restore into an empty installation.
 
 See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 
@@ -71,13 +71,12 @@ See the [deployment and maintenance guide](docs/DEPLOYMENT.md) for:
 - Git clone and update instructions;
 - backup and restore guidance;
 - configuration and remote HTTPS considerations;
-- accountability email operation and limitations; and
 - development and test commands.
 
 For implementation details, timing behavior, and the full security model, see [Purevault architecture and security boundary](docs/ARCHITECTURE.md).
 
 See the [sequential feature roadmap](docs/ROADMAP.md) for approved work that will be implemented and reviewed one feature at a time.
 
-Maintainers can follow the [container image publication guide](docs/PUBLISHING.md) to manually publish a reviewed `linux/amd64` image to GHCR. Until the first image is successfully published, made public, and anonymously pull-tested, continue using the source-build quick start above.
+Use the source-build quick start above until a public 8080-compatible image is verified. After that, the [prebuilt image quick start](docs/DEPLOYMENT.md#prebuilt-image-quick-start) is the shortest installation path. Maintainers can publish it using the [container image publication guide](docs/PUBLISHING.md).
 
-No open-source license has been selected yet.
+Purevault is available under the [MIT License](LICENSE).
